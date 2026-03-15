@@ -189,22 +189,6 @@ const DEFAULT_CONFIG: Omit<ClawRouteConfig, 'apiKeys' | 'overrides'> = {
 };
 
 /**
- * Load donation config from environment.
- *
- * @returns DonationConfig
- */
-function loadDonationConfig(): DonationConfig {
-    return {
-        minMonthlyUsd: parseFloat(process.env['CLAWROUTE_DONATION_SUGGESTED'] ?? '9'),
-        stripeCheckoutUrl: process.env['CLAWROUTE_DONATION_STRIPE_URL'],
-        usdcAddress: process.env['CLAWROUTE_DONATION_USDC_ADDR'],
-        buyMeCoffeeUrl: process.env['CLAWROUTE_DONATION_BMC_URL'],
-        nowPaymentsApiKey: process.env['CLAWROUTE_NOWPAYMENTS_API_KEY'],
-        enabled: true,
-    };
-}
-
-/**
  * Load alerts config from environment.
  *
  * @returns AlertsConfig
