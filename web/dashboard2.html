@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClawRoute 2.0</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --green: #3fb950;
+      --blue: #58a6ff;
+      --purple: #a371f7;
+      --yellow: #d29922;
+      --red: #f85149;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    /* Portal Nav (Zero-Latency Rendering) */
+    #portal-nav {
+      display: none;
+      background: rgba(13, 17, 23, 0.95);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(8px);
+    }
+    .portal-inner { display: flex; align-items: center; gap: 12px; max-width: 1200px; margin: 0 auto; font-size: 13px; }
+    .portal-link { color: var(--blue); text-decoration: none; }
+    .portal-current { color: var(--text-muted); }
+
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 32px; }
+    h1 { font-size: 20px; display: flex; align-items: center; gap: 8px; }
+    .status { display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); }
+    .status.live { border-color: var(--green); color: var(--green); }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+    .status.live .status-dot { animation: pulse 2s infinite; }
+
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+
+    /* Performance Optimized Grid (Subgrid ready) */
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; transition: border-color 0.2s; }
+    .card:hover { border-color: #8b949e; }
+    .card-label { font-size: 12px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; margin-bottom: 8px; }
+    .card-value { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .card-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .savings-value { color: var(--green); }
+
+    .section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
+    .section-title { font-size: 14px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+
+    /* Optimized Bars */
+    .tier-list { display: grid; gap: 12px; }
+    .tier-item { display: grid; grid-template-columns: 100px 1fr 120px; align-items: center; gap: 16px; }
+    .tier-name { font-size: 13px; color: var(--text-muted); }
+    .tier-track { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; }
+    .tier-bar { height: 100%; border-radius: 4px; width: 0; transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1); }
+    .tier-model { font-size: 11px; color: var(--text-muted); text-align: right; font-family: ui-monospace, SFMono-Regular, monospace; }
+
+    /* Tier Colors */
+    .bg-heartbeat { background: var(--green); }
+    .bg-simple { background: var(--blue); }
+    .bg-moderate { background: var(--purple); }
+    .bg-complex { background: var(--yellow); }
+    .bg-frontier { background: var(--red); }
+
+    /* Performance Table (containment for paint optimization) */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; contain: content; }
+    th { text-align: left; padding: 8px 12px; color: var(--text-muted); font-size: 11px; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+    td { padding: 10px 12px; border-bottom: 1px solid rgba(48, 54, 61, 0.4); }
+    tr:last-child td { border-bottom: none; }
+    .badge { padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+
+    .controls { display: flex; gap: 12px; margin-top: 24px; }
+    button { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+    button:hover { background: var(--border); }
+    button.primary { background: var(--green); border-color: var(--green); color: white; }
+    button.primary:hover { opacity: 0.9; }
+
+    footer { text-align: center; margin-top: 48px; font-size: 12px; color: var(--text-muted); }
+    a { color: var(--blue); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <nav id="portal-nav">
+    <div class="portal-inner">
+      <a href="/" class="portal-link">⊞ Services</a>
+      <span class="portal-current">› ClawRoute 2.0</span>
+    </div>
+  </nav>
+
+  <div class="container">
+    <header>
+      <h1><span>🦀</span> ClawRoute 2.0</h1>
+      <div id="status" class="status"><span class="status-dot"></span><span id="status-text">Loading...</span></div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <p class="card-label">Saved Today</p>
+        <p id="stat-savings-today" class="card-value savings-value">$0.00</p>
+        <p id="stat-savings-pct" class="card-sub">0% rate</p>
+      </div>
+      <div class="card">
+        <p class="card-label">Requests Today</p>
+        <p id="stat-requests-today" class="card-value">0</p>
+        <p id="stat-escalations" class="card-sub">0 escalations</p>
+      </div>
+      <div class="card">
+        <p class="card-label">Monthly Savings</p>
+        <p id="stat-savings-month" class="card-value savings-value">$0.00</p>
+        <p id="stat-requests-month" class="card-sub">0 requests</p>
+      </div>
+      <div class="card">
+        <p class="card-label">Plan & Billing</p>
+        <p id="stat-plan" class="card-value">-</p>
+        <p id="stat-billing-sub" class="card-sub">Loading...</p>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2 class="section-title">📊 Tier Distribution</h2>
+      <div id="tier-list" class="tier-list"></div>
+    </div>
+
+    <div class="section">
+      <h2 class="section-title">📋 Live Decisions</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Tier</th>
+            <th>Model</th>
+            <th>Saved</th>
+            <th>Latency</th>
+          </tr>
+        </thead>
+        <tbody id="decisions-body"></tbody>
+      </table>
+    </div>
+
+    <div class="controls">
+      <button onclick="apiAction('/api/enable')" class="primary">Enable</button>
+      <button onclick="apiAction('/api/dry-run/toggle')">Toggle Dry-Run</button>
+      <button onclick="apiAction('/api/disable')">Disable</button>
+    </div>
+
+    <footer>
+      ClawRoute 2.0 • Ultra-Light • <span id="last-update">Syncing...</span>
+    </footer>
+  </div>
+
+  <script>
+    const BASE = location.pathname.startsWith('/clawroute') ? '/clawroute' : '';
+    if (BASE) document.getElementById('portal-nav').style.display = 'block';
+
+    const state = {
+      lastUpdate: 0,
+      config: null,
+      today: null,
+      decisions: []
+    };
+
+    // Fast update DOM without re-rendering entire sections
+    function updateDOM(data) {
+      document.getElementById('stat-savings-today').textContent = `$${data.today.savingsUsd.toFixed(2)}`;
+      document.getElementById('stat-savings-pct').textContent = `${data.today.savingsPercent.toFixed(1)}% savings rate`;
+      document.getElementById('stat-requests-today').textContent = data.today.requests;
+      document.getElementById('stat-escalations').textContent = `${data.today.escalations} escalations`;
+      document.getElementById('stat-savings-month').textContent = `$${data.thisMonth.savingsUsd.toFixed(2)}`;
+      document.getElementById('stat-requests-month').textContent = `${data.thisMonth.requests} requests`;
+      
+      const status = document.getElementById('status');
+      const statusText = document.getElementById('status-text');
+      if (!data.config.enabled) {
+        status.className = 'status';
+        statusText.textContent = 'Disabled';
+      } else if (data.config.dryRun) {
+        status.className = 'status';
+        statusText.textContent = 'Dry-Run';
+      } else {
+        status.className = 'status live';
+        statusText.textContent = 'Live';
+      }
+
+      // Tier bars
+      const tierList = document.getElementById('tier-list');
+      const tiers = ['heartbeat', 'simple', 'moderate', 'complex', 'frontier'];
+      const max = Math.max(...tiers.map(t => data.today.tierBreakdown[t] || 0), 1);
+      
+      tierList.innerHTML = tiers.map(t => {
+        const count = data.today.tierBreakdown[t] || 0;
+        const pct = (count / max) * 100;
+        const model = (data.config.modelMap[t] || '').split('/').pop();
+        return `
+          <div class="tier-item">
+            <div class="tier-name">${t.charAt(0).toUpperCase() + t.slice(1)}</div>
+            <div class="tier-track"><div class="tier-bar bg-${t}" style="width: ${pct}%"></div></div>
+            <div class="tier-model">${model}</div>
+          </div>
+        `;
+      }).join('');
+
+      // Decisions table
+      const body = document.getElementById('decisions-body');
+      body.innerHTML = data.recentDecisions.slice(0, 10).map(d => `
+        <tr>
+          <td>${new Date(d.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</td>
+          <td><span class="badge" style="background: var(--${d.tier === 'heartbeat' ? 'green' : d.tier === 'simple' ? 'blue' : 'purple'}); color: #fff">${d.tier}</span></td>
+          <td style="font-family: monospace">${d.routedModel.split('/').pop()}</td>
+          <td style="color: var(--green)">+$${d.savingsUsd.toFixed(3)}</td>
+          <td>${d.responseTimeMs || 0}ms</td>
+        </tr>
+      `).join('');
+
+      document.getElementById('last-update').textContent = `Last sync: ${new Date().toLocaleTimeString()}`;
+    }
+
+    async function fetchData() {
+      try {
+        const res = await fetch(`${BASE}/stats`);
+        const data = await res.json();
+        updateDOM(data);
+        
+        // Billing fetch (separate to keep stats cycle fast)
+        if (Date.now() - state.lastUpdate > 60000) {
+          const bRes = await fetch(`${BASE}/billing/summary`);
+          const bData = await bRes.json();
+          document.getElementById('stat-plan').textContent = bData.plan.toUpperCase();
+          document.getElementById('stat-billing-sub').textContent = bData.graceActive ? 'Trial Active' : `$${bData.suggestedUsd.toFixed(2)} suggested`;
+          state.lastUpdate = Date.now();
+        }
+      } catch (e) {
+        console.error('Fetch error', e);
+      }
+    }
+
+    async function apiAction(path) {
+      if (path === '/api/dry-run/toggle') {
+        const res = await fetch(`${BASE}/stats`);
+        const data = await res.json();
+        path = data.config.dryRun ? '/api/dry-run/disable' : '/api/dry-run/enable';
+      }
+      await fetch(`${BASE}${path}`, { method: 'POST' });
+      fetchData();
+    }
+
+    // High-frequency "Live" feel with efficient sync
+    fetchData();
+    setInterval(fetchData, 5000);
+  </script>
+</body>
+</html>
