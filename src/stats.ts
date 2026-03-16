@@ -28,6 +28,9 @@ function emptyPeriodStats(): PeriodStats {
         },
         escalations: 0,
         dryRunRequests: 0,
+        slowRequests: 0,
+        p95ResponseMs: 0,
+        errorCount: 0,
     };
 }
 
@@ -50,7 +53,9 @@ function getStatsByPeriod(db: Database, whereClause: string): PeriodStats {
         COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
         COALESCE(SUM(savings_usd), 0) as savings,
         COALESCE(SUM(CASE WHEN escalated = 1 THEN 1 ELSE 0 END), 0) as escalations,
-        COALESCE(SUM(CASE WHEN is_dry_run = 1 THEN 1 ELSE 0 END), 0) as dry_runs
+        COALESCE(SUM(CASE WHEN is_dry_run = 1 THEN 1 ELSE 0 END), 0) as dry_runs,
+        COALESCE(SUM(CASE WHEN response_time_ms > 3000 THEN 1 ELSE 0 END), 0) as slow_requests,
+        COALESCE(SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END), 0) as error_count
       FROM routing_log
       ${whereClause ? `WHERE ${whereClause}` : ''}
     `);
@@ -63,10 +68,28 @@ function getStatsByPeriod(db: Database, whereClause: string): PeriodStats {
             stats.savingsUsd = row[3] as number;
             stats.escalations = row[4] as number;
             stats.dryRunRequests = row[5] as number;
+            stats.slowRequests = row[6] as number;
+            stats.errorCount = row[7] as number;
 
             if (stats.originalCostUsd > 0) {
                 stats.savingsPercent = (stats.savingsUsd / stats.originalCostUsd) * 100;
             }
+        }
+
+        // p95 response time — computed in JS from sorted response times for the period
+        const timingsResult = db.exec(`
+      SELECT response_time_ms FROM routing_log
+      ${whereClause ? `WHERE ${whereClause}` : ''}
+      ORDER BY response_time_ms
+    `);
+        const timingsData = timingsResult[0];
+        if (timingsData && timingsData.values.length > 0) {
+            const timings = timingsData.values.map((v) => v[0] as number);
+            const p95Idx = Math.min(
+                Math.floor(timings.length * 0.95),
+                timings.length - 1
+            );
+            stats.p95ResponseMs = timings[p95Idx] ?? 0;
         }
 
         // Tier breakdown

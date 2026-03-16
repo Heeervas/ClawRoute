@@ -136,6 +136,12 @@ export interface ExecutionResult {
     responseTimeMs: number;
     /** Whether the response contained tool calls */
     hadToolCalls: boolean;
+    /**
+     * For streaming responses: called by executor after stream completes
+     * with final token counts already written back to this result object.
+     * Server assigns this after executeRequest() returns.
+     */
+    logWhenDone?: () => void;
 }
 
 // === Config ===
@@ -378,6 +384,12 @@ export interface PeriodStats {
     escalations: number;
     /** Number of dry-run requests */
     dryRunRequests: number;
+    /** Requests with response_time_ms > 3000 */
+    slowRequests: number;
+    /** 95th percentile response time in ms */
+    p95ResponseMs: number;
+    /** Requests that errored */
+    errorCount: number;
 }
 
 /**

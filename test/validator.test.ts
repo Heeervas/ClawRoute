@@ -15,7 +15,7 @@ function createRequest(tools?: ChatCompletionRequest['tools']): ChatCompletionRe
 }
 
 function createResponse(
-    content: string | null = 'Test response',
+    content: string | null = 'Test response content here',
     toolCalls?: ChatCompletionResponse['choices'][0]['message']['tool_calls']
 ): ChatCompletionResponse {
     return {

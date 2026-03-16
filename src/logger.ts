@@ -9,8 +9,8 @@
  */
 
 import initSqlJs, { Database } from 'sql.js';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { dirname, resolve } from 'path';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { join, dirname, resolve } from 'path';
 import {
     ClawRouteConfig,
     LogEntry,
@@ -39,6 +39,25 @@ export async function initDb(config: ClawRouteConfig): Promise<void> {
     const dir = dirname(dbPath);
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
+    }
+
+    // Verify the data directory is actually writable — a bind-mount may be
+    // pointing at a deleted/stale/root-owned inode (common after force-rebuild
+    // without force-recreate). Fail fast with a clear message rather than
+    // silently logging EACCES on every request.
+    if (dbPath !== ':memory:') {
+        const probe = join(dir, '.write-probe');
+        try {
+            writeFileSync(probe, '');
+            unlinkSync(probe);
+        } catch (e) {
+            throw new Error(
+                `ClawRoute data directory is not writable: ${dir}\n` +
+                `If running in Docker, recreate the container:\n` +
+                `  docker compose up -d --force-recreate clawroute\n` +
+                `Underlying error: ${e}`
+            );
+        }
     }
 
     // Load existing DB or create new

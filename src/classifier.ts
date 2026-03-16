@@ -6,10 +6,16 @@
  *
  * Classification tiers:
  * - HEARTBEAT: ping/status checks, simple greetings
- * - SIMPLE: acknowledgments, short questions
- * - MODERATE: general conversation (default)
- * - COMPLEX: analytical tasks, tool usage
- * - FRONTIER: code generation, multi-step reasoning, forced tool use
+ * - SIMPLE: acknowledgments, short replies, brief questions
+ * - MODERATE: general conversation — the wide default bucket
+ * - COMPLEX: clear analytical/technical tasks
+ * - FRONTIER: explicit user opt-in only ("use frontier" / "#frontier")
+ *
+ * Design goals for OpenClaw:
+ * - OpenClaw always sends 17 tool schemas → tools alone are NOT a signal
+ * - OpenClaw accumulates large context quickly → token count is NOT a signal
+ * - Message count grows fast in agent loops → msg count is NOT a signal
+ * - Frontier is rare and expensive — user must opt in explicitly
  */
 
 import {
@@ -21,10 +27,25 @@ import {
 } from './types.js';
 import {
     getLastUserMessage,
-    estimateMessagesTokens,
 } from './utils.js';
 
 // === Classification Patterns ===
+
+/** * Explicit tier override hashtags — highest priority, short-circuit all heuristics.
+ * #mode-simple | #mode-moderate | #mode-complex | #mode-frontier
+ * Also accepts the legacy aliases: #frontier / "use frontier" for frontier.
+ */
+const MODE_TAG: Record<string, TaskTier> = {
+    'mode-simple':   TaskTier.SIMPLE,
+    'mode-moderate': TaskTier.MODERATE,
+    'mode-complex':  TaskTier.COMPLEX,
+    'mode-frontier': TaskTier.FRONTIER,
+};
+const MODE_TAG_PATTERN = /#(mode-simple|mode-moderate|mode-complex|mode-frontier)\b/i;
+
+/** * Explicit opt-in to frontier tier. User must include one of these phrases.
+ */
+const FRONTIER_EXPLICIT = /\buse frontier\b|#frontier\b/i;
 
 /**
  * Patterns for heartbeat/ping detection.
@@ -36,213 +57,126 @@ const HEARTBEAT_PATTERNS = [
 ];
 
 /**
- * Patterns for simple acknowledgments.
+ * Simple acknowledgment and short-reply patterns.
+ * Intentionally broad — short replies should be cheap.
  */
 const ACKNOWLEDGMENT_PATTERNS = [
-    /^(thanks|thank you|thx|ty)\s*[!.]*$/i,
-    /^(ok|okay|k|kk|alright|sure|yes|no|yep|nope|yeah|nah)\s*[!.]*$/i,
-    /^(got it|sounds good|cool|great|nice|perfect|awesome|agreed|right)\s*[!.]*$/i,
-    /^(lol|haha|hehe|lmao|rofl)\s*[!.]*$/i,
-    /^[👍🙏😊👌✅❤️]+$/,
+    /^(thanks|thank you|thx|ty|cheers)\s*[!.,]*$/i,
+    /^(ok|okay|k|kk|alright|sure|yes|no|yep|nope|yeah|nah|got it)\s*[!.,]*$/i,
+    /^(sounds good|cool|great|nice|perfect|awesome|agreed|right|makes sense)\s*[!.,]*$/i,
+    /^(lol|haha|hehe|lmao|rofl|lmfao)\s*[!.,]*$/i,
+    /^(done|continue|go ahead|proceed|next|skip)\s*[!.,]*$/i,
+    /^(no worries|np|no problem|don'?t worry)\s*[!.,]*$/i,
+    /^[👍🙏😊👌✅❤️🎉👏]+$/,
 ];
 
 /**
- * Keywords indicating frontier-level complexity.
- */
-const FRONTIER_KEYWORDS =
-    /\b(implement|architect|design|refactor|debug|optimize|prove|derive|analyze.{0,20}(code|system|architecture|algorithm))\b/i;
-
-/**
  * Keywords indicating complex analytical tasks.
+ * Checked against the actual user message (after metadata stripping).
  */
 const COMPLEX_KEYWORDS =
-    /\b(explain|compare|analyze|research|summarize|evaluate|assess|review|write.{0,10}(essay|report|article|doc|documentation))\b/i;
+    /\b(explain|compare|analyze|analyse|research|summarize|summarise|evaluate|assess|review|describe|elaborate|discuss|contrast|outline|list the (pros|cons|differences|advantages|disadvantages))\b/i;
 
 /**
- * Detect code blocks in text.
+ * Technical implementation intent — verb paired with a tech noun → complex.
+ * (These were previously frontier; moved down since gemini-flash handles them well.)
  */
-const CODE_BLOCK_PATTERN = /```[\s\S]*?```/;
+const TECHNICAL_VERB =
+    /\b(implement|refactor|debug|optimize|optimise|architect|migrate|integrate|scaffold|deploy|build|create|write|generate|fix|rewrite)\b/i;
 
-/**
- * Pattern for simple questions.
- */
-const SIMPLE_QUESTION_PATTERN = /^[^?]{0,100}\?$/;
+const TECHNICAL_NOUN =
+    /\b(function|class|module|component|service|api|endpoint|algorithm|data.?struct(ure)?|tree|graph|heap|queue|stack|linked.?list|hash.?map|database|schema|pipeline|microservice|middleware|interface|generic|hook|query|mutation|resolver|worker|parser|compiler|lexer|sdk|cli|cron|daemon|script|test|spec|migration)\b/i;
 
 // === Classification Functions ===
 
 /**
- * Check if the message matches heartbeat patterns.
+ * FRONTIER: explicit opt-in only.
+ * User must write "use frontier" or "#frontier" in their message.
+ */
+function isFrontier(
+    lastMessage: string
+): { match: boolean; confidence: number; signals: string[] } {
+    if (FRONTIER_EXPLICIT.test(lastMessage)) {
+        return { match: true, confidence: 0.99, signals: ['explicit_opt_in'] };
+    }
+    return { match: false, confidence: 0, signals: [] };
+}
+
+/**
+ * COMPLEX: clear technical or analytical intent from the message content.
+ * Does NOT use token count or message count — both are unreliable for OpenClaw.
+ */
+function isComplex(
+    lastMessage: string
+): { match: boolean; confidence: number; signals: string[] } {
+    const signals: string[] = [];
+
+    // Explicit analytical/research task
+    if (COMPLEX_KEYWORDS.test(lastMessage)) {
+        signals.push('analytical_keywords');
+        return { match: true, confidence: 0.8, signals };
+    }
+
+    // Technical verb + technical noun pair — genuine implementation request
+    if (TECHNICAL_VERB.test(lastMessage) && TECHNICAL_NOUN.test(lastMessage)) {
+        signals.push('technical_task');
+        return { match: true, confidence: 0.8, signals };
+    }
+
+    // Long detailed message — multi-part question or detailed instructions
+    // Threshold 600 chars ≈ 3–4 sentences. Short follow-ups won't trigger this.
+    if (lastMessage.length > 600) {
+        signals.push('long_message');
+        return { match: true, confidence: 0.75, signals };
+    }
+
+    return { match: false, confidence: 0, signals };
+}
+
+/**
+ * HEARTBEAT: ultra-short ping/status patterns.
  */
 function isHeartbeat(
     lastMessage: string,
     messageCount: number,
     hasTools: boolean
 ): { match: boolean; confidence: number } {
-    // Check explicit heartbeat patterns
     for (const pattern of HEARTBEAT_PATTERNS) {
         if (pattern.test(lastMessage.trim())) {
             return { match: true, confidence: 0.95 };
         }
     }
-
-    // Short message + few messages + no tools
-    if (
-        lastMessage.length < 30 &&
-        messageCount <= 2 &&
-        !hasTools
-    ) {
+    // Very short + fresh conversation + no tools
+    if (lastMessage.length < 25 && messageCount <= 2 && !hasTools) {
         return { match: true, confidence: 0.8 };
     }
-
     return { match: false, confidence: 0 };
 }
 
 /**
- * Check if the message is a simple acknowledgment.
+ * SIMPLE: acknowledgment, short reply, or brief factual question.
+ * Intentionally catches more than before — cheap model handles these fine.
  */
 function isSimple(
-    lastMessage: string,
-    messageCount: number,
-    hasTools: boolean
+    lastMessage: string
 ): { match: boolean; confidence: number } {
     const trimmed = lastMessage.trim();
 
-    // Check acknowledgment patterns
+    // Acknowledgment patterns
     for (const pattern of ACKNOWLEDGMENT_PATTERNS) {
         if (pattern.test(trimmed)) {
             return { match: true, confidence: 0.9 };
         }
     }
 
-    // Short message without tools
-    if (trimmed.length < 80 && !hasTools) {
-        // Simple question ending with ?
-        if (
-            SIMPLE_QUESTION_PATTERN.test(trimmed) &&
-            messageCount <= 2
-        ) {
-            return { match: true, confidence: 0.8 };
-        }
+    // Short message (≤ 40 chars) that isn't a complex/technical request
+    // — safety net for very short one-liners that aren't in acknowledgment patterns.
+    // Kept tight so genuine factual questions (47+ chars) fall through to MODERATE.
+    if (trimmed.length <= 40 && !COMPLEX_KEYWORDS.test(trimmed) && !TECHNICAL_VERB.test(trimmed)) {
+        return { match: true, confidence: 0.8 };
     }
 
     return { match: false, confidence: 0 };
-}
-
-/**
- * Check if the request is frontier-level complexity.
- */
-function isFrontier(
-    request: ChatCompletionRequest,
-    lastMessage: string,
-    estimatedTokens: number
-): { match: boolean; confidence: number; signals: string[] } {
-    const signals: string[] = [];
-
-    // Tools defined + tool_choice set = definitely frontier
-    const hasTools = request.tools && request.tools.length > 0;
-    const hasToolChoice =
-        request.tool_choice !== undefined &&
-        request.tool_choice !== null &&
-        request.tool_choice !== 'none';
-
-    if (hasTools && hasToolChoice) {
-        signals.push('tools_with_tool_choice');
-        return { match: true, confidence: 0.9, signals };
-    }
-
-    // Code blocks present
-    if (CODE_BLOCK_PATTERN.test(lastMessage)) {
-        signals.push('code_blocks');
-        return { match: true, confidence: 0.85, signals };
-    }
-
-    // Long message with frontier keywords
-    if (lastMessage.length > 500 && FRONTIER_KEYWORDS.test(lastMessage)) {
-        signals.push('long_with_frontier_keywords');
-        return { match: true, confidence: 0.8, signals };
-    }
-
-    // Truly massive context — agents with 17+ tools and long histories easily
-    // accumulate 10–15K tokens in a normal chat. Only flag this as frontier
-    // when the context is genuinely excessive (30K+).
-    if (estimatedTokens > 30000) {
-        signals.push('massive_context');
-        return { match: true, confidence: 0.75, signals };
-    }
-
-    // Check for multimodal content (images)
-    const hasImages = request.messages.some((m) => {
-        if (typeof m.content === 'object' && Array.isArray(m.content)) {
-            return m.content.some(
-                (c: unknown) =>
-                    typeof c === 'object' && c !== null && 'type' in c && (c as Record<string, unknown>).type === 'image_url'
-            );
-        }
-        return false;
-    });
-
-    if (hasImages) {
-        signals.push('multimodal_images');
-        return { match: true, confidence: 0.8, signals };
-    }
-
-    return { match: false, confidence: 0, signals };
-}
-
-/**
- * Check if the request is complex-level.
- */
-function isComplex(
-    request: ChatCompletionRequest,
-    lastMessage: string,
-    messageCount: number,
-    estimatedTokens: number
-): { match: boolean; confidence: number; signals: string[] } {
-    const signals: string[] = [];
-
-    // Tools present AND the last message has analytical keywords — tools alone
-    // are never sufficient since OpenClaw always sends 17 tools per request.
-    // Require both complex keywords AND a substantive message length.
-    if (
-        request.tools &&
-        request.tools.length > 0 &&
-        lastMessage.length >= 500 &&
-        COMPLEX_KEYWORDS.test(lastMessage)
-    ) {
-        signals.push('tools_with_complex_content');
-        return { match: true, confidence: 0.8, signals };
-    }
-
-    // Analytical keywords with moderate length (no tools required)
-    if (
-        lastMessage.length >= 400 &&
-        COMPLEX_KEYWORDS.test(lastMessage)
-    ) {
-        signals.push('analytical_keywords');
-        return { match: true, confidence: 0.8, signals };
-    }
-
-    // Very long last message — detailed multi-part request
-    if (lastMessage.length > 2000) {
-        signals.push('long_message');
-        return { match: true, confidence: 0.75, signals };
-    }
-
-    // Deep conversation — 25+ messages indicates a sustained analytical session.
-    // Raised from 8 because agent loops easily have 20+ messages for trivial tasks.
-    if (messageCount > 25) {
-        signals.push('deep_conversation');
-        return { match: true, confidence: 0.7, signals };
-    }
-
-    // Large context — raised from 4K–8K to 15K–30K to account for tool schemas
-    // (~5K tokens) and normal multi-turn history that agents accumulate.
-    if (estimatedTokens >= 15000 && estimatedTokens <= 30000) {
-        signals.push('large_context');
-        return { match: true, confidence: 0.7, signals };
-    }
-
-    return { match: false, confidence: 0, signals };
 }
 
 /**
@@ -259,13 +193,30 @@ export function classifyRequest(
     const messages = request.messages;
     const lastMessage = getLastUserMessage(messages);
     const messageCount = messages.length;
-    const estimatedTokens = estimateMessagesTokens(messages);
     const hasTools = Boolean(request.tools && request.tools.length > 0);
 
     const signals: string[] = [];
     let tier: TaskTier = TaskTier.MODERATE;
     let confidence = 0.85;
     let reason = 'default classification';
+
+    // RULE GROUP 0 (PRIORITY): explicit #mode-* tag — overrides everything
+    const modeTagMatch = lastMessage.match(MODE_TAG_PATTERN);
+    if (modeTagMatch) {
+        const tag = modeTagMatch[1]!.toLowerCase();
+        tier = MODE_TAG[tag]!;
+        confidence = 0.99;
+        reason = `explicit tag: #${tag}`;
+        signals.push('mode_tag_override');
+        return {
+            tier,
+            confidence,
+            reason,
+            signals,
+            toolsDetected: hasTools,
+            safeToRetry: tier === TaskTier.HEARTBEAT || tier === TaskTier.SIMPLE,
+        };
+    }
 
     // Check for model name hints (opportunistic)
     const modelLower = request.model.toLowerCase();
@@ -291,20 +242,20 @@ export function classifyRequest(
         }
     }
 
-    // RULE GROUP 2: FRONTIER (check BEFORE simple to catch complex cases)
-    if (tier === TaskTier.MODERATE || tier === TaskTier.HEARTBEAT) {
-        const frontierCheck = isFrontier(request, lastMessage, estimatedTokens);
-        if (frontierCheck.match) {
-            tier = TaskTier.FRONTIER;
-            confidence = frontierCheck.confidence;
-            reason = `frontier: ${frontierCheck.signals.join(', ')}`;
-            signals.push(...frontierCheck.signals);
+    // RULE GROUP 2: SIMPLE — check before complex so short replies aren't mis-classified
+    if (tier === TaskTier.MODERATE) {
+        const simpleCheck = isSimple(lastMessage);
+        if (simpleCheck.match) {
+            tier = TaskTier.SIMPLE;
+            confidence = simpleCheck.confidence;
+            reason = 'simple acknowledgment or short reply';
+            signals.push('simple_pattern');
         }
     }
 
     // RULE GROUP 3: COMPLEX
     if (tier === TaskTier.MODERATE) {
-        const complexCheck = isComplex(request, lastMessage, messageCount, estimatedTokens);
+        const complexCheck = isComplex(lastMessage);
         if (complexCheck.match) {
             tier = TaskTier.COMPLEX;
             confidence = complexCheck.confidence;
@@ -313,15 +264,13 @@ export function classifyRequest(
         }
     }
 
-    // RULE GROUP 4: SIMPLE
-    if (tier === TaskTier.MODERATE) {
-        const simpleCheck = isSimple(lastMessage, messageCount, hasTools);
-        if (simpleCheck.match) {
-            tier = TaskTier.SIMPLE;
-            confidence = simpleCheck.confidence;
-            reason = 'simple acknowledgment or question';
-            signals.push('simple_pattern');
-        }
+    // RULE GROUP 4: FRONTIER — explicit opt-in only; overrides all tiers
+    const frontierCheck = isFrontier(lastMessage);
+    if (frontierCheck.match) {
+        tier = TaskTier.FRONTIER;
+        confidence = frontierCheck.confidence;
+        reason = `frontier: ${frontierCheck.signals.join(', ')}`;
+        signals.push(...frontierCheck.signals);
     }
 
     // RULE GROUP 5: MODERATE (already default)
@@ -407,7 +356,8 @@ export function explainClassification(result: ClassificationResult): string {
         [TaskTier.SIMPLE]: 'Simple (acknowledgment/short question)',
         [TaskTier.MODERATE]: 'Moderate (general conversation)',
         [TaskTier.COMPLEX]: 'Complex (analytical/tools)',
-        [TaskTier.FRONTIER]: 'Frontier (code/reasoning)',
+        [TaskTier.FRONTIER]: 'Frontier (explicit opt-in)',
+
     };
 
     return `${tierNames[result.tier]} - ${result.reason} (confidence: ${(result.confidence * 100).toFixed(0)}%)`;

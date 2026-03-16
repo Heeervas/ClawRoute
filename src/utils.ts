@@ -61,7 +61,28 @@ export function estimateMessagesTokens(messages: ChatMessage[]): number {
 }
 
 /**
+ * Strip leading untrusted-metadata preamble blocks that OpenClaw prepends to
+ * user messages.  Each block looks like:
+ *
+ *   Sender (untrusted metadata):\n```json\n{...}\n```\n
+ *   Conversation info (untrusted metadata):\n```json\n{...}\n```\n
+ *
+ * Stripping them ensures the classifier and prompt_preview see only the actual
+ * user text, not JSON code fences that would falsely trigger code_block signals.
+ */
+export function stripMetadataPreamble(text: string): string {
+    // Matches a single "<label> (untrusted metadata):" block with a fenced code block.
+    const METADATA_BLOCK = /^[^\n]+ \(untrusted metadata\):\n```[^\n]*\n[\s\S]*?\n```\n?\n?/;
+    let result = text;
+    while (METADATA_BLOCK.test(result)) {
+        result = result.replace(METADATA_BLOCK, '');
+    }
+    return result.trim();
+}
+
+/**
  * Get the last user message from an array of messages.
+ * Metadata preamble blocks (untrusted metadata) are stripped before returning.
  *
  * @param messages - Array of chat messages
  * @returns The last user message content, or empty string if none
@@ -69,8 +90,18 @@ export function estimateMessagesTokens(messages: ChatMessage[]): number {
 export function getLastUserMessage(messages: ChatMessage[]): string {
     for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i];
-        if (msg?.role === 'user' && typeof msg.content === 'string') {
-            return msg.content;
+        if (msg?.role === 'user') {
+            let raw = '';
+            if (typeof msg.content === 'string') {
+                raw = msg.content;
+            } else if (Array.isArray(msg.content)) {
+                // Handle multimodal (ContentPart[]) — extract text parts
+                raw = (msg.content as Array<{ type: string; text?: string }>)
+                    .filter((p) => p.type === 'text' && p.text)
+                    .map((p) => p.text!)
+                    .join(' ');
+            }
+            if (raw) return stripMetadataPreamble(raw);
         }
     }
     return '';

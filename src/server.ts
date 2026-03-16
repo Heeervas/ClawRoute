@@ -7,6 +7,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { readFileSync, existsSync } from 'fs';
+import { createHash } from 'crypto';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import {
@@ -21,7 +22,7 @@ import { executeRequest, executePassthrough } from './executor.js';
 import { logRouting } from './logger.js';
 import { getStatsResponse } from './stats.js';
 import { getRedactedConfig } from './config.js';
-import { generateRequestId, nowIso } from './utils.js';
+import { generateRequestId, nowIso, stripMetadataPreamble } from './utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -219,9 +220,10 @@ export function createApp(config: ClawRouteConfig): Hono {
             // Execute the request
             const result = await executeRequest(body, routing, classification, config);
 
-            // Log asynchronously (don't block response)
-            setImmediate(() => {
-                // Extract last user message text for prompt_preview
+            // Build the log entry for this request.
+            // For streaming: called by executor after stream completes (accurate tokens).
+            // For non-streaming: called via setImmediate (tokens already correct in result).
+            const buildAndLog = () => {
                 const lastUserMsg = [...(body.messages ?? [])]
                     .reverse()
                     .find((m) => m.role === 'user');
@@ -233,7 +235,11 @@ export function createApp(config: ClawRouteConfig): Hono {
                             .map((p) => p.text ?? '')
                             .join(' ')
                         : null;
-                const promptPreview = rawText ? rawText.slice(0, 300) : null;
+
+                // P7: Strip untrusted metadata preamble blocks so prompt_preview
+                // shows the actual user message, not OpenClaw metadata JSON.
+                const cleanText = rawText ? stripMetadataPreamble(rawText) : '';
+                const promptPreview = cleanText ? cleanText.slice(0, 300) : null;
 
                 const contextInfo = JSON.stringify({
                     msg_count: (body.messages ?? []).length,
@@ -241,6 +247,15 @@ export function createApp(config: ClawRouteConfig): Hono {
                     tool_count: (body.tools ?? []).length,
                     last_role: (body.messages ?? []).at(-1)?.role ?? null,
                 });
+
+                // P3b: Extract session ID from system prompt sender_id (hashed for privacy)
+                const sysMsg = (body.messages ?? []).find((m) => m.role === 'system');
+                const sysContent = typeof sysMsg?.content === 'string' ? sysMsg.content : '';
+                const senderMatch = sysContent.match(/"sender_id"\s*:\s*"(\d+)"/);
+                const senderId = senderMatch?.[1];
+                const sessionId = senderId
+                    ? createHash('sha256').update(senderId).digest('hex').slice(0, 8)
+                    : null;
 
                 const logEntry: LogEntry = {
                     timestamp: nowIso(),
@@ -261,7 +276,7 @@ export function createApp(config: ClawRouteConfig): Hono {
                     had_tool_calls: result.hadToolCalls,
                     is_dry_run: routing.isDryRun,
                     is_override: routing.isOverride,
-                    session_id: null,
+                    session_id: sessionId,
                     error: null,
                     prompt_preview: promptPreview,
                     context_info: contextInfo,
@@ -273,7 +288,15 @@ export function createApp(config: ClawRouteConfig): Hono {
                         `[${requestId}] Complete: ${result.responseTimeMs}ms, saved $${result.savingsUsd.toFixed(4)}`
                     );
                 }
-            });
+            };
+
+            // P1: For streaming, fire log callback after stream ends (executor back-fills tokens).
+            //     For non-streaming, log asynchronously via setImmediate (tokens already correct).
+            if (body.stream) {
+                result.logWhenDone = buildAndLog;
+            } else {
+                setImmediate(buildAndLog);
+            }
 
             return result.response;
         } catch (error) {

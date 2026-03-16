@@ -121,6 +121,38 @@ export const DEFAULT_MODELS: ModelEntry[] = [
         multimodal: true,
         enabled: true,
     },
+
+    // OpenRouter-prefixed variants (same model, cost tracked via OpenRouter)
+    {
+        id: 'openrouter/google/gemini-2.5-flash-lite',
+        provider: 'openrouter',
+        inputCostPer1M: 0.10,
+        outputCostPer1M: 0.40,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    {
+        id: 'openrouter/google/gemini-2.5-flash',
+        provider: 'openrouter',
+        inputCostPer1M: 0.30,
+        outputCostPer1M: 2.50,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    {
+        id: 'openrouter/google/gemini-2.5-pro',
+        provider: 'openrouter',
+        inputCostPer1M: 1.25,
+        outputCostPer1M: 10.00,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
 ];
 
 /**

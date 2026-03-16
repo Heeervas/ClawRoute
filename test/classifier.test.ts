@@ -179,21 +179,29 @@ describe('Classifier', () => {
 
     // ========== FRONTIER TESTS ==========
     describe('Frontier Detection', () => {
-        it('should classify request with tools + tool_choice as frontier', () => {
+        it('should classify request with tools + tool_choice as complex (not frontier — explicit frontier only)', () => {
             const tools = [
                 { type: 'function' as const, function: { name: 'get_weather', description: 'Get weather' } }
             ];
             const result = classifyRequest(
-                createRequest('What is the weather?', 1, tools, 'auto'),
+                createRequest('What is the weather?', 1, tools, 'required'),
                 config
             );
-            expect(result.tier).toBe(TaskTier.FRONTIER);
+            // tool_choice='required' escalates to COMPLEX (not FRONTIER — frontier requires explicit opt-in)
+            expect(result.tier).toBe(TaskTier.COMPLEX);
         });
 
-        it('should classify code blocks as frontier', () => {
+        it('should classify verb+noun coding request as complex (not frontier — explicit opt-in only)', () => {
+            // "implement" (verb) + "algorithm" (noun) → complex (moved from frontier)
+            const result = classifyRequest(createRequest('Can you implement a sorting algorithm in TypeScript?'), config);
+            expect(result.tier).toBe(TaskTier.COMPLEX);
+        });
+
+        it('should NOT classify casual code-paste review as frontier (no verb+noun)', () => {
+            // Code block is present but no frontier verb+noun pair → should NOT be frontier
             const message = 'Please review this code:\n```python\ndef hello():\n    print("hello")\n```';
             const result = classifyRequest(createRequest(message), config);
-            expect(result.tier).toBe(TaskTier.FRONTIER);
+            expect(result.tier).not.toBe(TaskTier.FRONTIER);
         });
 
         it('should classify "implement a binary search tree in TypeScript" with context as complex/frontier', () => {
@@ -206,11 +214,12 @@ describe('Classifier', () => {
             expect([TaskTier.COMPLEX, TaskTier.FRONTIER]).toContain(result.tier);
         });
 
-        it('should classify very long context as frontier', () => {
-            // Create a very long message
+        it('should classify very long message as complex (not frontier — explicit opt-in only)', () => {
+            // Long message with analytical keyword → complex
             const longMessage = 'Please analyze this: ' + 'x'.repeat(10000);
             const result = classifyRequest(createRequest(longMessage), config);
-            expect(result.tier).toBe(TaskTier.FRONTIER);
+            // analytical_keywords ("analyze") + long_message → COMPLEX
+            expect(result.tier).toBe(TaskTier.COMPLEX);
         });
     });
 
@@ -221,8 +230,8 @@ describe('Classifier', () => {
                 { type: 'function' as const, function: { name: 'search', description: 'Search' } }
             ];
             const result = classifyRequest(createRequest('Search for something', 1, tools), config);
-            // Short message with tools but no forced tool_choice → MODERATE (content-based)
-            expect(result.tier).toBe(TaskTier.MODERATE);
+            // Short message with tools but no forced tool_choice → SIMPLE (content-based, ≤120 chars, no complex keywords)
+            expect(result.tier).toBe(TaskTier.SIMPLE);
         });
 
         it('should classify "explain the differences between REST and GraphQL" as complex', () => {
@@ -233,10 +242,11 @@ describe('Classifier', () => {
             expect([TaskTier.COMPLEX, TaskTier.MODERATE]).toContain(result.tier);
         });
 
-        it('should classify deep conversations as complex', () => {
-            // Create a request with 10 messages
-            const result = classifyRequest(createRequest('Continue the discussion', 10), config);
-            expect(result.tier).toBe(TaskTier.COMPLEX);
+        it('should classify short follow-up in deep conversation as simple (not complex)', () => {
+            // deep_conversation signal removed — message CONTENT drives classification, not count.
+            // A short acknowledgment in a 30-turn conversation should still be cheap.
+            const result = classifyRequest(createRequest('okay thanks!', 30), config);
+            expect([TaskTier.HEARTBEAT, TaskTier.SIMPLE]).toContain(result.tier);
         });
     });
 
@@ -280,13 +290,13 @@ describe('Classifier', () => {
             expect(result.tier).toBe(TaskTier.SIMPLE);
         });
 
-        it('should escalate to frontier when tool_choice is forced (auto)', () => {
+        it('should escalate to complex (not frontier) when tool_choice is forced (required)', () => {
             const tools = [
                 { type: 'function' as const, function: { name: 'search', description: 'Search' } }
             ];
-            const result = classifyRequest(createRequest('hi', 1, tools, 'auto'), config);
-            // Explicit tool_choice signals intent to use tools → frontier
-            expect(result.tier).toBe(TaskTier.FRONTIER);
+            const result = classifyRequest(createRequest('hi', 1, tools, 'required'), config);
+            // tool_choice='required' forces tool use → escalates to COMPLEX (frontier requires explicit opt-in)
+            expect(result.tier).toBe(TaskTier.COMPLEX);
         });
     });
 
@@ -359,7 +369,9 @@ describe('Ollama Provider Routing', () => {
     it('should resolve ollama api base url from OLLAMA_ENDPOINT env', () => {
         const original = process.env['OLLAMA_ENDPOINT'];
         process.env['OLLAMA_ENDPOINT'] = 'http://ollama:11434';
-        expect(getApiBaseUrl('ollama')).toBe('http://ollama:11434/v1');
+        // getApiBaseUrl returns the raw endpoint (no /v1 suffix).
+        // makeProviderRequest appends /api/chat for the native Ollama path.
+        expect(getApiBaseUrl('ollama')).toBe('http://ollama:11434');
         if (original === undefined) {
             delete process.env['OLLAMA_ENDPOINT'];
         } else {
@@ -370,7 +382,8 @@ describe('Ollama Provider Routing', () => {
     it('should fall back to default ollama endpoint when env not set', () => {
         const original = process.env['OLLAMA_ENDPOINT'];
         delete process.env['OLLAMA_ENDPOINT'];
-        expect(getApiBaseUrl('ollama')).toBe('http://ollama:11434/v1');
+        // Default endpoint has no /v1 suffix — path is appended by makeProviderRequest.
+        expect(getApiBaseUrl('ollama')).toBe('http://ollama:11434');
         if (original !== undefined) {
             process.env['OLLAMA_ENDPOINT'] = original;
         }

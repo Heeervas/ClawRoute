@@ -222,23 +222,8 @@ export async function executeRequest(
             const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
             const writer = writable.getWriter();
 
-            // Start piping in the background
-            const provider = getProviderForModel(currentModel);
-            const streamPromise = (provider === 'ollama'
-                ? pipeOllamaStream(response!, writer, currentModel)
-                : pipeStream(response!, writer)
-            ).then(async (result: StreamResult) => {
-                hadToolCalls = result.hadToolCalls;
-                if (result.inputTokens > 0) inputTokens = result.inputTokens;
-                if (result.outputTokens > 0) outputTokens = result.outputTokens;
-                await writer.close();
-            });
-
-            // Don't await - let it stream in the background
-            streamPromise.catch(() => {
-                // Errors are handled in pipeStream
-            });
-
+            // Build the result object first so the streamPromise closure can update it
+            // once the stream is fully consumed and final token counts are known.
             const streamResponse = new Response(readable, {
                 status: response!.status,
                 statusText: response!.statusText,
@@ -249,8 +234,7 @@ export async function executeRequest(
                     'X-ClawRoute-Escalated': String(escalated),
                 },
             });
-
-            return buildExecutionResult(
+            const execResult = buildExecutionResult(
                 streamResponse,
                 routingDecision,
                 currentModel,
@@ -261,6 +245,33 @@ export async function executeRequest(
                 hadToolCalls,
                 startTime
             );
+
+            // Start piping in the background
+            const provider = getProviderForModel(currentModel);
+            (provider === 'ollama'
+                ? pipeOllamaStream(response!, writer, currentModel)
+                : pipeStream(response!, writer)
+            ).then(async (streamResult: StreamResult) => {
+                hadToolCalls = streamResult.hadToolCalls;
+                if (streamResult.inputTokens > 0) inputTokens = streamResult.inputTokens;
+                if (streamResult.outputTokens > 0) outputTokens = streamResult.outputTokens;
+                // Close writer; ignore if client already disconnected
+                await writer.close().catch(() => {});
+            }).catch(() => {
+                // Stream error — writer may already be errored/closed
+            }).finally(() => {
+                // Always back-fill costs and log, even on client disconnect or stream error.
+                // This ensures every upstream API call is recorded in the DB.
+                execResult.inputTokens = inputTokens;
+                execResult.outputTokens = outputTokens;
+                execResult.hadToolCalls = hadToolCalls;
+                execResult.originalCostUsd = calculateCost(routingDecision.originalModel, inputTokens, outputTokens);
+                execResult.actualCostUsd = calculateCost(currentModel, inputTokens, outputTokens);
+                execResult.savingsUsd = Math.max(0, execResult.originalCostUsd - execResult.actualCostUsd);
+                execResult.logWhenDone?.();
+            });
+
+            return execResult;
         }
 
         // Non-streaming response or error.
