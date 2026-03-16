@@ -4,7 +4,7 @@
  * Queries for computing statistics from the routing log.
  */
 
-import { PeriodStats, StatsResponse, TaskTier, ClawRouteConfig, DonationSummary } from './types.js';
+import { PeriodStats, StatsResponse, TaskTier, ClawRouteConfig } from './types.js';
 import { getDb, getRecentDecisions } from './logger.js';
 import { getModelMap } from './router.js';
 import { Database } from 'sql.js';
@@ -204,82 +204,3 @@ export function getStartupSummary(config: ClawRouteConfig): string {
 
     return `Total savings: $${stats.allTime.savingsUsd.toFixed(2)} across ${stats.allTime.requests} requests (${stats.allTime.savingsPercent.toFixed(1)}% savings rate)`;
 }
-
-// === Donation Summary (v1.1) ===
-
-/**
- * Get donation summary for the current month.
- *
- * @param config - The ClawRoute configuration
- * @returns DonationSummary
- */
-export function getDonationSummary(config: ClawRouteConfig): DonationSummary {
-    const db = getDb();
-
-    // Get current month boundaries
-    const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-
-    // Default empty summary
-    const emptySummary: DonationSummary = {
-        monthStart: monthStart.toISOString(),
-        monthEnd: monthEnd.toISOString(),
-        savingsUsd: 0,
-        originalCostUsd: 0,
-        actualCostUsd: 0,
-        percentSavings: 0,
-        suggestedUsd: config.donations.minMonthlyUsd,
-        requests: 0,
-    };
-
-    if (!db) {
-        return emptySummary;
-    }
-
-    try {
-        // Query monthly stats
-        const whereClause = `date(timestamp) >= date('${monthStart.toISOString().split('T')[0]}')`;
-
-        const result = db.exec(`
-      SELECT
-        COUNT(*) as requests,
-        COALESCE(SUM(original_cost_usd), 0) as original_cost,
-        COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-        COALESCE(SUM(savings_usd), 0) as savings
-      FROM routing_log
-      WHERE ${whereClause}
-    `);
-
-        if (result[0] && result[0].values[0]) {
-            const row = result[0].values[0];
-            const requests = row[0] as number;
-            const originalCostUsd = row[1] as number;
-            const actualCostUsd = row[2] as number;
-            const savingsUsd = row[3] as number;
-
-            const percentSavings = originalCostUsd > 0
-                ? (savingsUsd / originalCostUsd) * 100
-                : 0;
-
-            // Suggested donation: purely voluntary, defaults to min monthly
-            const suggestedUsd = config.donations.minMonthlyUsd;
-
-            return {
-                monthStart: monthStart.toISOString(),
-                monthEnd: monthEnd.toISOString(),
-                savingsUsd,
-                originalCostUsd,
-                actualCostUsd,
-                percentSavings,
-                suggestedUsd,
-                requests,
-            };
-        }
-    } catch {
-        // Return empty summary on error
-    }
-
-    return emptySummary;
-}
-

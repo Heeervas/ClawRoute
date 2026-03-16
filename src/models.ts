@@ -88,6 +88,18 @@ export const DEFAULT_MODELS: ModelEntry[] = [
         enabled: true,
     },
 
+    // Local / Ollama (explicit routing only — not in auto-tier table)
+    {
+        id: 'ollama/llama3.2:1b',
+        provider: 'ollama',
+        inputCostPer1M: 0,
+        outputCostPer1M: 0,
+        maxContext: 32768,
+        toolCapable: false,
+        multimodal: false,
+        enabled: true,
+    },
+
     // Frontier tier
     {
         id: 'openai/o3',
@@ -161,7 +173,7 @@ export function getProviderForModel(modelId: string): ProviderType {
     // Check if model ID has provider prefix
     if (modelId.includes('/')) {
         const prefix = modelId.split('/')[0]?.toLowerCase();
-        if (prefix === 'anthropic' || prefix === 'openai' || prefix === 'google' || prefix === 'deepseek' || prefix === 'openrouter') {
+        if (prefix === 'anthropic' || prefix === 'openai' || prefix === 'google' || prefix === 'deepseek' || prefix === 'openrouter' || prefix === 'ollama') {
             return prefix as ProviderType;
         }
     }
@@ -227,6 +239,8 @@ export function getApiBaseUrl(provider: ProviderType): string {
             return 'https://api.deepseek.com/v1';
         case 'openrouter':
             return 'https://openrouter.ai/api/v1';
+        case 'ollama':
+            return process.env.OLLAMA_ENDPOINT ?? 'http://ollama:11434';
         default:
             return 'https://api.openai.com/v1';
     }
@@ -244,6 +258,9 @@ export function getAuthHeader(
     apiKey: string
 ): Record<string, string> {
     switch (provider) {
+        case 'ollama':
+            // Ollama runs locally — no API key required
+            return {};
         case 'anthropic':
             return {
                 'x-api-key': apiKey,

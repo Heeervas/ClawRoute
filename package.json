@@ -37,9 +37,11 @@
     "license": "MIT",
     "dependencies": {
         "@hono/node-server": "^1.13.7",
+        "bcrypt": "^6.0.0",
         "dotenv": "^16.4.7",
         "hono": "^4.6.16",
-        "sql.js": "^1.11.0"
+        "sql.js": "^1.11.0",
+        "undici": "^6.24.1"
     },
     "devDependencies": {
         "@types/node": "^22.10.6",

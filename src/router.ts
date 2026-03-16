@@ -142,8 +142,22 @@ export function getEscalatedModel(
     ];
 
     const currentIndex = tierOrder.indexOf(currentTier);
-    if (currentIndex === -1 || currentIndex >= tierOrder.length - 1) {
-        // Already at max tier or unknown tier
+    if (currentIndex === -1) {
+        // Unknown tier
+        return null;
+    }
+
+    // Try current tier's own fallback first (e.g. openrouter when Ollama fails)
+    const currentTierConfig = config.models[currentTier];
+    if (currentTierConfig) {
+        const fallbackProvider = getProviderForModel(currentTierConfig.fallback);
+        if (hasApiKey(config, fallbackProvider)) {
+            return { model: currentTierConfig.fallback, tier: currentTier };
+        }
+    }
+
+    if (currentIndex >= tierOrder.length - 1) {
+        // Already at max tier and fallback was tried above
         return null;
     }
 

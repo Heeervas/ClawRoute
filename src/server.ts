@@ -18,8 +18,8 @@ import { createAuthMiddleware } from './auth.js';
 import { classifyRequest, explainClassification } from './classifier.js';
 import { routeRequest } from './router.js';
 import { executeRequest, executePassthrough } from './executor.js';
-import { logRouting, recordPayment } from './logger.js';
-import { getStatsResponse, getDonationSummary } from './stats.js';
+import { logRouting } from './logger.js';
+import { getStatsResponse } from './stats.js';
 import { getRedactedConfig } from './config.js';
 import { generateRequestId, nowIso } from './utils.js';
 
@@ -221,6 +221,27 @@ export function createApp(config: ClawRouteConfig): Hono {
 
             // Log asynchronously (don't block response)
             setImmediate(() => {
+                // Extract last user message text for prompt_preview
+                const lastUserMsg = [...(body.messages ?? [])]
+                    .reverse()
+                    .find((m) => m.role === 'user');
+                const rawText = typeof lastUserMsg?.content === 'string'
+                    ? lastUserMsg.content
+                    : Array.isArray(lastUserMsg?.content)
+                        ? (lastUserMsg.content as Array<{ type: string; text?: string }>)
+                            .filter((p) => p.type === 'text')
+                            .map((p) => p.text ?? '')
+                            .join(' ')
+                        : null;
+                const promptPreview = rawText ? rawText.slice(0, 300) : null;
+
+                const contextInfo = JSON.stringify({
+                    msg_count: (body.messages ?? []).length,
+                    has_system: (body.messages ?? []).some((m) => m.role === 'system'),
+                    tool_count: (body.tools ?? []).length,
+                    last_role: (body.messages ?? []).at(-1)?.role ?? null,
+                });
+
                 const logEntry: LogEntry = {
                     timestamp: nowIso(),
                     original_model: routing.originalModel,
@@ -242,6 +263,8 @@ export function createApp(config: ClawRouteConfig): Hono {
                     is_override: routing.isOverride,
                     session_id: null,
                     error: null,
+                    prompt_preview: promptPreview,
+                    context_info: contextInfo,
                 };
                 logRouting(logEntry);
 
@@ -293,93 +316,7 @@ export function createApp(config: ClawRouteConfig): Hono {
         );
     });
 
-    // === Donation & Billing Endpoints (v1.1) ===
-
-    // Get donation summary
-    app.get('/billing/summary', (c) => {
-        const summary = getDonationSummary(config);
-        return c.json(summary);
-    });
-
-    // Acknowledge donation
-    app.post('/billing/acknowledge', async (c) => {
-        try {
-            const body = await c.req.json() as {
-                amountUsd?: number;
-                method?: 'stripe' | 'usdc' | 'manual';
-                note?: string;
-            };
-
-            if (!body.amountUsd || !body.method) {
-                return c.json({ error: 'Provide amountUsd and method' }, 400);
-            }
-
-            // Record payment in database (as a donation)
-            recordPayment(body.amountUsd, body.method, body.note);
-
-            console.log(`💰 Donation acknowledged: $${body.amountUsd} via ${body.method}`);
-
-            // Return updated summary
-            const summary = getDonationSummary(config);
-            return c.json({ success: true, ...summary });
-        } catch {
-            return c.json({ error: 'Invalid JSON body' }, 400);
-        }
-    });
-
-    // Get payment links
-    app.get('/billing/paylinks', (c) => {
-        return c.json({
-            stripeUrl: config.donations.stripeCheckoutUrl ?? null,
-            usdcAddress: config.donations.usdcAddress ?? null,
-            buyMeCoffeeUrl: config.donations.buyMeCoffeeUrl ?? null,
-            nowPaymentsEnabled: !!config.donations.nowPaymentsApiKey,
-        });
-    });
-
-    // Create NOWPayments invoice for donation
-    app.post('/billing/nowpayments/invoice', async (c) => {
-        if (!config.donations.nowPaymentsApiKey) {
-            return c.json({ error: 'NOWPayments not configured' }, 400);
-        }
-
-        try {
-            const body = await c.req.json() as { amountUsd?: number };
-            const amount = body.amountUsd ?? config.donations.minMonthlyUsd;
-
-            const response = await fetch('https://api.nowpayments.io/v1/invoice', {
-                method: 'POST',
-                headers: {
-                    'x-api-key': config.donations.nowPaymentsApiKey,
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    price_amount: amount,
-                    price_currency: 'usd',
-                    order_id: `clawroute-donation-${Date.now()}`,
-                    order_description: `ClawRoute Donation - $${amount}`,
-                    success_url: `http://${config.proxyHost}:${config.proxyPort}/dashboard?payment=success`,
-                    cancel_url: `http://${config.proxyHost}:${config.proxyPort}/dashboard?payment=cancelled`,
-                }),
-            });
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error('NOWPayments error:', errorText);
-                return c.json({ error: 'Failed to create invoice' }, 502);
-            }
-
-            const invoice = await response.json() as { invoice_url?: string; id?: string };
-            console.log(`🪙 Donation invoice created: ${invoice.id}`);
-            return c.json({ success: true, invoiceUrl: invoice.invoice_url, invoiceId: invoice.id });
-        } catch (error) {
-            console.error('NOWPayments error:', error);
-            return c.json({ error: 'Failed to create invoice' }, 500);
-        }
-    });
-
-    // Legacy license endpoints removed via Donationware refactor
-
+    // Legacy license endpoints removed
 
 
     // Catch-all for unknown routes

@@ -157,13 +157,15 @@ function isFrontier(
     }
 
     // Long message with frontier keywords
-    if (lastMessage.length > 1000 && FRONTIER_KEYWORDS.test(lastMessage)) {
+    if (lastMessage.length > 500 && FRONTIER_KEYWORDS.test(lastMessage)) {
         signals.push('long_with_frontier_keywords');
         return { match: true, confidence: 0.8, signals };
     }
 
-    // Massive context
-    if (estimatedTokens > 8000) {
+    // Truly massive context — agents with 17+ tools and long histories easily
+    // accumulate 10–15K tokens in a normal chat. Only flag this as frontier
+    // when the context is genuinely excessive (30K+).
+    if (estimatedTokens > 30000) {
         signals.push('massive_context');
         return { match: true, confidence: 0.75, signals };
     }
@@ -198,31 +200,45 @@ function isComplex(
 ): { match: boolean; confidence: number; signals: string[] } {
     const signals: string[] = [];
 
-    // Tools present (without explicit tool_choice)
-    if (request.tools && request.tools.length > 0) {
-        signals.push('tools_present');
-        return { match: true, confidence: 0.85, signals };
+    // Tools present AND the last message has analytical keywords — tools alone
+    // are never sufficient since OpenClaw always sends 17 tools per request.
+    // Require both complex keywords AND a substantive message length.
+    if (
+        request.tools &&
+        request.tools.length > 0 &&
+        lastMessage.length >= 500 &&
+        COMPLEX_KEYWORDS.test(lastMessage)
+    ) {
+        signals.push('tools_with_complex_content');
+        return { match: true, confidence: 0.8, signals };
     }
 
-    // Analytical keywords with moderate length
+    // Analytical keywords with moderate length (no tools required)
     if (
-        lastMessage.length >= 500 &&
-        lastMessage.length <= 1000 &&
+        lastMessage.length >= 400 &&
         COMPLEX_KEYWORDS.test(lastMessage)
     ) {
         signals.push('analytical_keywords');
         return { match: true, confidence: 0.8, signals };
     }
 
-    // Deep conversation
-    if (messageCount > 8) {
-        signals.push('deep_conversation');
+    // Very long last message — detailed multi-part request
+    if (lastMessage.length > 2000) {
+        signals.push('long_message');
         return { match: true, confidence: 0.75, signals };
     }
 
-    // Medium-large context
-    if (estimatedTokens >= 4000 && estimatedTokens <= 8000) {
-        signals.push('medium_context');
+    // Deep conversation — 25+ messages indicates a sustained analytical session.
+    // Raised from 8 because agent loops easily have 20+ messages for trivial tasks.
+    if (messageCount > 25) {
+        signals.push('deep_conversation');
+        return { match: true, confidence: 0.7, signals };
+    }
+
+    // Large context — raised from 4K–8K to 15K–30K to account for tool schemas
+    // (~5K tokens) and normal multi-turn history that agents accumulate.
+    if (estimatedTokens >= 15000 && estimatedTokens <= 30000) {
+        signals.push('large_context');
         return { match: true, confidence: 0.7, signals };
     }
 
@@ -316,12 +332,19 @@ export function classifyRequest(
 
     // === POST-CLASSIFICATION ADJUSTMENTS ===
 
-    // Tool-aware routing: if tools present and tier < COMPLEX, escalate
+    // Tool-aware routing: only escalate when tool use is FORCED (tool_choice
+    // === 'required' or a specific function object). Agents like OpenClaw
+    // always pass tool definitions in every request, so the bare presence of
+    // tools is not a reliable complexity signal.
     if (config.classification.toolAwareRouting && hasTools) {
-        if (TIER_ORDER[tier] < TIER_ORDER[TaskTier.COMPLEX]) {
+        const tc = request.tool_choice;
+        const forcedToolUse =
+            tc === 'required' ||
+            (typeof tc === 'object' && tc !== null && 'type' in tc);
+        if (forcedToolUse && TIER_ORDER[tier] < TIER_ORDER[TaskTier.COMPLEX]) {
             const oldTier = tier;
             tier = TaskTier.COMPLEX;
-            reason = `escalated from ${oldTier}: tool schemas present`;
+            reason = `escalated from ${oldTier}: forced tool use`;
             signals.push('tool_aware_escalation');
             confidence = Math.min(confidence, 0.8);
         }

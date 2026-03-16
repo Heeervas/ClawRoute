@@ -54,10 +54,8 @@ function createTestConfig(): ClawRouteConfig {
             google: 'test-key',
             deepseek: 'test-key',
             openrouter: '',
+            ollama: '',
         },
-        // v1.1: License, billing, alerts
-        license: { enabled: true, plan: 'pro' },
-        billing: { proRatePercent: 0.02, minMonthlyUsd: 9, graceDays: 7 },
         alerts: {},
     };
 }

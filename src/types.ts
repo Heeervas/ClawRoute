@@ -54,7 +54,7 @@ export interface ClassificationResult {
 /**
  * Supported LLM providers.
  */
-export type ProviderType = 'anthropic' | 'openai' | 'google' | 'deepseek' | 'openrouter';
+export type ProviderType = 'anthropic' | 'openai' | 'google' | 'deepseek' | 'openrouter' | 'ollama';
 
 /**
  * Model entry with cost and capability information.
@@ -236,9 +236,6 @@ export interface ClawRouteConfig {
 
     /** API keys from environment (NEVER stored in config files) */
     apiKeys: Record<ProviderType, string>;
-
-    /** Donation configuration (v1.1) */
-    donations: DonationConfig;
 
     /** Alerts configuration (v1.1) */
     alerts: AlertsConfig;
@@ -474,6 +471,10 @@ export interface LogEntry {
     session_id: string | null;
     /** Error message if any */
     error: string | null;
+    /** Truncated last user prompt (max 300 chars, only when logContent enabled) */
+    prompt_preview: string | null;
+    /** JSON context info: msg_count, has_system, tool_count, last_role */
+    context_info: string | null;
 }
 
 // === Validation ===
@@ -491,46 +492,6 @@ export interface ValidationResult {
 }
 
 // === Donation & Community Support (v1.1) ===
-
-/**
- * Donation configuration.
- */
-export interface DonationConfig {
-    /** Suggested monthly donation in USD (default 9) */
-    minMonthlyUsd: number;
-    /** Optional Stripe checkout URL */
-    stripeCheckoutUrl?: string;
-    /** Optional USDC payment address */
-    usdcAddress?: string;
-    /** Optional Buy Me a Coffee URL */
-    buyMeCoffeeUrl?: string;
-    /** Optional NOWPayments API key */
-    nowPaymentsApiKey?: string;
-    /** Whether donations are enabled */
-    enabled: boolean;
-}
-
-/**
- * Monthly donation summary.
- */
-export interface DonationSummary {
-    /** ISO timestamp - first day of month */
-    monthStart: string;
-    /** ISO timestamp - last day of month or now */
-    monthEnd: string;
-    /** Total savings in USD */
-    savingsUsd: number;
-    /** Total original cost in USD */
-    originalCostUsd: number;
-    /** Total actual cost in USD */
-    actualCostUsd: number;
-    /** Savings as percentage of original cost */
-    percentSavings: number;
-    /** Suggested donation amount in USD */
-    suggestedUsd: number;
-    /** Total requests this month */
-    requests: number;
-}
 
 /**
  * Alerts configuration (Pro feature).

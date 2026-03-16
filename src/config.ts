@@ -17,7 +17,6 @@ import {
     TaskTier,
     TierModelConfig,
     ProviderType,
-    DonationConfig,
     AlertsConfig,
 } from './types.js';
 
@@ -178,12 +177,6 @@ const DEFAULT_CONFIG: Omit<ClawRouteConfig, 'apiKeys' | 'overrides'> = {
         enabled: true,
     },
 
-    // v1.1: Donation defaults
-    donations: {
-        minMonthlyUsd: 9,
-        enabled: true,
-    },
-
     // v1.1: Alerts defaults (disabled)
     alerts: {},
 };
@@ -212,6 +205,7 @@ function loadApiKeys(): Record<ProviderType, string> {
         google: process.env['GOOGLE_API_KEY'] ?? '',
         deepseek: process.env['DEEPSEEK_API_KEY'] ?? '',
         openrouter: process.env['OPENROUTER_API_KEY'] ?? '',
+        ollama: '', // Local — no API key required
     };
 }
 
@@ -222,7 +216,11 @@ function loadApiKeys(): Record<ProviderType, string> {
  * @returns True if at least one key is set
  */
 function hasAnyApiKey(apiKeys: Record<ProviderType, string>): boolean {
-    return Object.values(apiKeys).some((key) => key && key.length > 0);
+    // Ollama is local and requires no API key — treat a set OLLAMA_ENDPOINT as configured
+    if (process.env['OLLAMA_ENDPOINT']) return true;
+    return Object.entries(apiKeys)
+        .filter(([provider]) => provider !== 'ollama')
+        .some(([, key]) => key && key.length > 0);
 }
 
 /**
@@ -336,9 +334,6 @@ export function loadConfig(): ClawRouteConfig {
     // Reload API keys (in case they were updated)
     config.apiKeys = loadApiKeys();
 
-    // v1.1: Load donation configuration from environment
-    config.donations = loadDonationConfig();
-
     // v1.1: Load alerts configuration from environment
     config.alerts = loadAlertsConfig();
 
@@ -364,6 +359,7 @@ export function getRedactedConfig(
         google: config.apiKeys.google ? '[REDACTED]' : '',
         deepseek: config.apiKeys.deepseek ? '[REDACTED]' : '',
         openrouter: config.apiKeys.openrouter ? '[REDACTED]' : '',
+        ollama: '', // No API key for Ollama
     };
 
     return {
@@ -381,6 +377,8 @@ export function getRedactedConfig(
  * @returns True if the provider's API key is set
  */
 export function hasApiKey(config: ClawRouteConfig, provider: ProviderType): boolean {
+    // Ollama is local — always available without an API key
+    if (provider === 'ollama') return true;
     const key = config.apiKeys[provider];
     return key !== undefined && key.length > 0;
 }

@@ -53,10 +53,13 @@ export async function pipeStream(
 
     let chunkCount = 0;
     let buffer = '';
+    let idleTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => reader.cancel('idle timeout'), 45_000);
 
     try {
         while (true) {
             const { done, value } = await reader.read();
+
+            if (idleTimer) { clearTimeout(idleTimer); }
 
             if (done) {
                 // Process any remaining buffer
@@ -65,6 +68,8 @@ export async function pipeStream(
                 }
                 break;
             }
+
+            idleTimer = setTimeout(() => reader.cancel('idle timeout'), 45_000);
 
             // Write immediately to client (zero buffering)
             await writer.write(value);
@@ -91,6 +96,7 @@ export async function pipeStream(
             // Ignore errors closing the stream
         }
     } finally {
+        if (idleTimer) { clearTimeout(idleTimer); }
         try {
             reader.releaseLock();
         } catch {
@@ -185,6 +191,216 @@ interface StreamChunk {
         completion_tokens?: number;
         total_tokens?: number;
     };
+}
+
+/**
+ * Stream an Ollama native NDJSON response, converting to OpenAI SSE format.
+ */
+export async function pipeOllamaStream(
+    upstreamResponse: Response,
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    modelId: string
+): Promise<StreamResult> {
+    const result: StreamResult = {
+        inputTokens: 0,
+        outputTokens: 0,
+        hadToolCalls: false,
+        error: null,
+    };
+
+    const body = upstreamResponse.body;
+    if (!body) {
+        result.error = 'No response body';
+        return result;
+    }
+
+    const reader = body.getReader();
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let idleTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => reader.cancel('idle timeout'), 45_000);
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+
+            if (idleTimer) { clearTimeout(idleTimer); }
+
+            if (done) {
+                if (buffer.trim()) {
+                    await processOllamaLine(buffer.trim(), result, writer, encoder, modelId);
+                }
+                break;
+            }
+
+            idleTimer = setTimeout(() => reader.cancel('idle timeout'), 45_000);
+
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed) {
+                    await processOllamaLine(trimmed, result, writer, encoder, modelId);
+                }
+            }
+        }
+    } catch (error) {
+        result.error = error instanceof Error ? error.message : 'Stream error';
+
+        try {
+            await writer.write(encoder.encode('data: [DONE]\n\n'));
+        } catch {
+            // Ignore
+        }
+    } finally {
+        if (idleTimer) { clearTimeout(idleTimer); }
+        try {
+            reader.releaseLock();
+        } catch {
+            // Ignore
+        }
+    }
+
+    return result;
+}
+
+async function processOllamaLine(
+    line: string,
+    result: StreamResult,
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    encoder: InstanceType<typeof TextEncoder>,
+    modelId: string
+): Promise<void> {
+    const parsed = safeJsonParse<OllamaChunk>(line);
+    if (!parsed) return;
+
+    const msg = parsed.message;
+    const isDone = parsed.done === true;
+
+    // Build OpenAI-compatible SSE chunk
+    const toolCalls = msg?.tool_calls;
+    if (toolCalls && toolCalls.length > 0) {
+        result.hadToolCalls = true;
+    }
+
+    const delta: Record<string, unknown> = {};
+    if (msg?.role) delta.role = msg.role;
+    if (msg?.content) delta.content = msg.content;
+    if (toolCalls && toolCalls.length > 0) {
+        delta.tool_calls = toolCalls.map((tc, i) => ({
+            index: i,
+            id: `call_${i}`,
+            type: 'function' as const,
+            function: {
+                name: tc.function?.name ?? '',
+                arguments: typeof tc.function?.arguments === 'string'
+                    ? tc.function.arguments
+                    : JSON.stringify(tc.function?.arguments ?? {}),
+            },
+        }));
+    }
+
+    const finishReason = isDone ? (parsed.done_reason ?? 'stop') : null;
+
+    const chunk: Record<string, unknown> = {
+        id: 'chatcmpl-ollama',
+        object: 'chat.completion.chunk',
+        model: modelId,
+        choices: [{
+            index: 0,
+            delta,
+            finish_reason: finishReason,
+        }],
+    };
+
+    if (isDone && parsed.prompt_eval_count != null) {
+        const inputTokens = parsed.prompt_eval_count;
+        const outputTokens = parsed.eval_count ?? 0;
+        result.inputTokens = inputTokens;
+        result.outputTokens = outputTokens;
+        chunk.usage = {
+            prompt_tokens: inputTokens,
+            completion_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+        };
+    }
+
+    const sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+    await writer.write(encoder.encode(sseData));
+
+    if (isDone) {
+        await writer.write(encoder.encode('data: [DONE]\n\n'));
+    }
+}
+
+interface OllamaChunk {
+    model?: string;
+    created_at?: string;
+    message?: {
+        role?: string;
+        content?: string;
+        tool_calls?: Array<{
+            function?: {
+                name?: string;
+                arguments?: unknown;
+            };
+        }>;
+    };
+    done?: boolean;
+    done_reason?: string;
+    prompt_eval_count?: number;
+    eval_count?: number;
+}
+
+/**
+ * Convert an Ollama non-streaming response to OpenAI format.
+ */
+export function adaptOllamaResponse(rawBody: string, modelId: string): string {
+    const parsed = safeJsonParse<OllamaChunk>(rawBody);
+    if (!parsed) return rawBody;
+
+    const msg = parsed.message;
+    const message: Record<string, unknown> = {
+        role: msg?.role ?? 'assistant',
+        content: msg?.content ?? '',
+    };
+
+    if (msg?.tool_calls && msg.tool_calls.length > 0) {
+        message.tool_calls = msg.tool_calls.map((tc, i) => ({
+            id: `call_${i}`,
+            type: 'function',
+            function: {
+                name: tc.function?.name ?? '',
+                arguments: typeof tc.function?.arguments === 'string'
+                    ? tc.function.arguments
+                    : JSON.stringify(tc.function?.arguments ?? {}),
+            },
+        }));
+    }
+
+    const inputTokens = parsed.prompt_eval_count ?? 0;
+    const outputTokens = parsed.eval_count ?? 0;
+
+    const openaiResponse = {
+        id: 'chatcmpl-ollama',
+        object: 'chat.completion',
+        model: modelId,
+        choices: [{
+            index: 0,
+            message,
+            finish_reason: parsed.done_reason ?? 'stop',
+        }],
+        usage: {
+            prompt_tokens: inputTokens,
+            completion_tokens: outputTokens,
+            total_tokens: inputTokens + outputTokens,
+        },
+    };
+
+    return JSON.stringify(openaiResponse);
 }
 
 /**

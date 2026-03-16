@@ -6,6 +6,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { classifyRequest } from '../src/classifier.js';
+import { getProviderForModel, getApiBaseUrl } from '../src/models.js';
 import { TaskTier, ChatCompletionRequest, ClawRouteConfig } from '../src/types.js';
 
 // Helper to create a minimal config for testing
@@ -45,10 +46,7 @@ function createTestConfig(): ClawRouteConfig {
         },
         dashboard: { enabled: true },
         overrides: { globalForceModel: null, sessions: {} },
-        apiKeys: { anthropic: '', openai: '', google: '', deepseek: '', openrouter: '' },
-        // v1.1: License, billing, alerts
-        license: { enabled: true, plan: 'pro' },
-        billing: { proRatePercent: 0.02, minMonthlyUsd: 9, graceDays: 7 },
+        apiKeys: { anthropic: '', openai: '', google: '', deepseek: '', openrouter: '', ollama: '' },
         alerts: {},
     };
 }
@@ -218,12 +216,13 @@ describe('Classifier', () => {
 
     // ========== COMPLEX TESTS ==========
     describe('Complex Detection', () => {
-        it('should classify request with tools (no tool_choice) as complex', () => {
+        it('should NOT classify request with tools (no tool_choice) as complex — tools alone are not a complexity signal', () => {
             const tools = [
                 { type: 'function' as const, function: { name: 'search', description: 'Search' } }
             ];
             const result = classifyRequest(createRequest('Search for something', 1, tools), config);
-            expect(result.tier).toBe(TaskTier.COMPLEX);
+            // Short message with tools but no forced tool_choice → MODERATE (content-based)
+            expect(result.tier).toBe(TaskTier.MODERATE);
         });
 
         it('should classify "explain the differences between REST and GraphQL" as complex', () => {
@@ -263,21 +262,31 @@ describe('Classifier', () => {
 
     // ========== TOOL-AWARE ROUTING TESTS ==========
     describe('Tool-Aware Escalation', () => {
-        it('should escalate heartbeat to complex when tools present', () => {
+        it('should NOT escalate heartbeat just because tools are defined (no tool_choice)', () => {
             const tools = [
                 { type: 'function' as const, function: { name: 'get_time', description: 'Get time' } }
             ];
             const result = classifyRequest(createRequest('hi', 1, tools), config);
-            // Should be escalated due to tools
-            expect([TaskTier.COMPLEX, TaskTier.FRONTIER]).toContain(result.tier);
+            // Tools defined but no forced tool use — should stay heartbeat
+            expect(result.tier).toBe(TaskTier.HEARTBEAT);
         });
 
-        it('should escalate simple to complex when tools present', () => {
+        it('should NOT escalate simple just because tools are defined (no tool_choice)', () => {
             const tools = [
                 { type: 'function' as const, function: { name: 'send_message', description: 'Send msg' } }
             ];
             const result = classifyRequest(createRequest('ok', 1, tools), config);
-            expect([TaskTier.COMPLEX, TaskTier.FRONTIER]).toContain(result.tier);
+            // Tools defined but no forced tool use — should stay simple
+            expect(result.tier).toBe(TaskTier.SIMPLE);
+        });
+
+        it('should escalate to frontier when tool_choice is forced (auto)', () => {
+            const tools = [
+                { type: 'function' as const, function: { name: 'search', description: 'Search' } }
+            ];
+            const result = classifyRequest(createRequest('hi', 1, tools, 'auto'), config);
+            // Explicit tool_choice signals intent to use tools → frontier
+            expect(result.tier).toBe(TaskTier.FRONTIER);
         });
     });
 
@@ -335,5 +344,35 @@ describe('Classifier', () => {
             const result = classifyRequest(request, config);
             expect(result.tier).toBe(TaskTier.HEARTBEAT);
         });
+    });
+});
+
+describe('Ollama Provider Routing', () => {
+    it('should detect ollama/ prefix as ollama provider', () => {
+        expect(getProviderForModel('ollama/granite4:350m')).toBe('ollama');
+    });
+
+    it('should detect plain ollama/ prefix model', () => {
+        expect(getProviderForModel('ollama/llama3')).toBe('ollama');
+    });
+
+    it('should resolve ollama api base url from OLLAMA_ENDPOINT env', () => {
+        const original = process.env['OLLAMA_ENDPOINT'];
+        process.env['OLLAMA_ENDPOINT'] = 'http://ollama:11434';
+        expect(getApiBaseUrl('ollama')).toBe('http://ollama:11434/v1');
+        if (original === undefined) {
+            delete process.env['OLLAMA_ENDPOINT'];
+        } else {
+            process.env['OLLAMA_ENDPOINT'] = original;
+        }
+    });
+
+    it('should fall back to default ollama endpoint when env not set', () => {
+        const original = process.env['OLLAMA_ENDPOINT'];
+        delete process.env['OLLAMA_ENDPOINT'];
+        expect(getApiBaseUrl('ollama')).toBe('http://ollama:11434/v1');
+        if (original !== undefined) {
+            process.env['OLLAMA_ENDPOINT'] = original;
+        }
     });
 });

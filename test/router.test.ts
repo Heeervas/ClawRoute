@@ -48,16 +48,7 @@ function createTestConfig(overrides: Partial<ClawRouteConfig> = {}): ClawRouteCo
             google: 'test-key',
             deepseek: 'test-key',
             openrouter: '',
-        },
-        // v1.1: License, billing, alerts
-        license: {
-            enabled: true,  // Pro for tests - full routing
-            plan: 'pro',
-        },
-        billing: {
-            proRatePercent: 0.02,
-            minMonthlyUsd: 9,
-            graceDays: 7,
+            ollama: '',
         },
         alerts: {},
         ...overrides,
@@ -139,6 +130,7 @@ describe('Router', () => {
                     google: '',
                     deepseek: '',
                     openrouter: '',
+                    ollama: '',
                 },
             });
 
@@ -159,6 +151,7 @@ describe('Router', () => {
                     google: '',
                     deepseek: '',
                     openrouter: '',
+                    ollama: '',
                 },
             });
 
@@ -242,17 +235,39 @@ describe('Router', () => {
     });
 
     describe('Escalation', () => {
-        it('should return next tier model for escalation', () => {
+        it('should try current tier fallback first', () => {
             const config = createTestConfig();
 
             const result = getEscalatedModel(TaskTier.SIMPLE, config);
 
             expect(result).not.toBeNull();
-            expect(result?.tier).toBe(TaskTier.MODERATE);
+            // Should return SIMPLE tier's own fallback before walking up
+            expect(result?.tier).toBe(TaskTier.SIMPLE);
+            expect(result?.model).toBe('google/gemini-2.5-flash');
         });
 
-        it('should return null when at max tier', () => {
+        it('should return fallback at max tier', () => {
             const config = createTestConfig();
+
+            const result = getEscalatedModel(TaskTier.FRONTIER, config);
+
+            // Now tries the tier's own fallback instead of returning null
+            expect(result).not.toBeNull();
+            expect(result?.tier).toBe(TaskTier.FRONTIER);
+            expect(result?.model).toBe('openai/gpt-4o');
+        });
+
+        it('should return null at max tier with no fallback key', () => {
+            const config = createTestConfig({
+                apiKeys: {
+                    anthropic: '',
+                    openai: '',
+                    google: '',
+                    deepseek: '',
+                    openrouter: '',
+                    ollama: '',
+                },
+            });
 
             const result = getEscalatedModel(TaskTier.FRONTIER, config);
 
@@ -275,6 +290,7 @@ describe('Router', () => {
                     google: '',
                     deepseek: '',
                     openrouter: '',
+                    ollama: '',
                 },
             });
 

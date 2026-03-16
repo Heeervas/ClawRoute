@@ -18,13 +18,6 @@ import {
     TaskTier,
 } from './types.js';
 
-interface PaymentAck {
-    timestamp: string;
-    amountUsd: number;
-    method: 'stripe' | 'usdc' | 'manual';
-    note?: string;
-}
-
 // === Singleton State ===
 
 let db: Database | null = null;
@@ -81,19 +74,23 @@ export async function initDb(config: ClawRouteConfig): Promise<void> {
             is_dry_run INTEGER NOT NULL DEFAULT 0,
             is_override INTEGER NOT NULL DEFAULT 0,
             session_id TEXT,
-            error TEXT
+            error TEXT,
+            prompt_preview TEXT,
+            context_info TEXT
         )
     `);
 
-    db.run(`
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            amount_usd REAL NOT NULL,
-            method TEXT NOT NULL,
-            note TEXT
-        )
-    `);
+    // Migrate existing DBs: add new columns if they don't exist yet
+    for (const colDef of [
+        'prompt_preview TEXT',
+        'context_info TEXT',
+    ]) {
+        try {
+            db.run(`ALTER TABLE routing_log ADD COLUMN ${colDef}`);
+        } catch {
+            // Column already exists — safe to ignore
+        }
+    }
 
     // Create indexes for common queries
     db.run(`
@@ -153,8 +150,9 @@ export function logRouting(entry: LogEntry): void {
                 original_cost_usd, actual_cost_usd, savings_usd,
                 escalated, escalation_chain, response_time_ms,
                 had_tool_calls, is_dry_run, is_override,
-                session_id, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                session_id, error,
+                prompt_preview, context_info
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 entry.timestamp,
                 entry.original_model,
@@ -176,6 +174,8 @@ export function logRouting(entry: LogEntry): void {
                 entry.is_override ? 1 : 0,
                 entry.session_id,
                 entry.error,
+                entry.prompt_preview ?? null,
+                entry.context_info ?? null,
             ]
         );
 
@@ -265,68 +265,6 @@ export function pruneOldEntries(retentionDays: number): number {
     } catch (error) {
         console.warn('Failed to prune old entries:', error);
         return 0;
-    }
-}
-
-// === Payments (v1.1) ===
-
-/**
- * Record a payment acknowledgment.
- *
- * @param amountUsd - Amount paid in USD
- * @param method - Payment method ('stripe' | 'usdc' | 'manual')
- * @param note - Optional note
- */
-export function recordPayment(
-    amountUsd: number,
-    method: 'stripe' | 'usdc' | 'manual',
-    note?: string
-): void {
-    if (!db) return;
-
-    try {
-        db.run(
-            `INSERT INTO payments (timestamp, amount_usd, method, note)
-             VALUES (?, ?, ?, ?)`,
-            [new Date().toISOString(), amountUsd, method, note ?? null]
-        );
-        persistDb();
-    } catch (error) {
-        console.warn('Failed to record payment:', error);
-    }
-}
-
-/**
- * Get all payment records.
- *
- * @returns Array of payment acknowledgments
- */
-export function getPayments(): PaymentAck[] {
-    if (!db) return [];
-
-    try {
-        const stmt = db.prepare(
-            `SELECT timestamp, amount_usd, method, note
-             FROM payments
-             ORDER BY id DESC`
-        );
-
-        const payments: PaymentAck[] = [];
-        while (stmt.step()) {
-            const row = stmt.getAsObject() as Record<string, unknown>;
-            payments.push({
-                timestamp: row['timestamp'] as string,
-                amountUsd: row['amount_usd'] as number,
-                method: row['method'] as 'stripe' | 'usdc' | 'manual',
-                note: row['note'] as string | undefined,
-            });
-        }
-        stmt.free();
-
-        return payments;
-    } catch (error) {
-        console.warn('Failed to get payments:', error);
-        return [];
     }
 }
 
