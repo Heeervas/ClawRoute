@@ -12,6 +12,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { homedir } from 'os';
 import {
     ClawRouteConfig,
     TaskTier,
@@ -132,7 +133,11 @@ const DEFAULT_TIER_MODELS: Record<TaskTier, TierModelConfig> = {
         primary: 'anthropic/claude-sonnet-4-6',
         fallback: 'openai/gpt-5.2',
     },
-    [TaskTier.FRONTIER]: {
+    [TaskTier.FRONTIER_SONNET]: {
+        primary: 'anthropic/claude-sonnet-4-6',
+        fallback: 'openai/gpt-5',
+    },
+    [TaskTier.FRONTIER_OPUS]: {
         primary: 'anthropic/claude-opus-4-6',
         fallback: 'openai/o3',
     },
@@ -144,6 +149,8 @@ const DEFAULT_TIER_MODELS: Record<TaskTier, TierModelConfig> = {
 const DEFAULT_CONFIG: Omit<ClawRouteConfig, 'apiKeys' | 'overrides'> = {
     enabled: true,
     dryRun: false,
+    baselineModel: 'openrouter/anthropic/claude-sonnet-4.6',
+    providerProfile: null,
     proxyPort: 18790,
     proxyHost: '127.0.0.1',
     authToken: null,
@@ -194,6 +201,40 @@ function loadAlertsConfig(): AlertsConfig {
 }
 
 /**
+ * Load the Codex OAuth token.
+ *
+ * Priority:
+ * 1. OPENAI_CODEX_TOKEN env var (explicit sess- token)
+ * 2. OPENAI_CODEX_AUTH_PATH env var (path to a codex auth.json)
+ * 3. Default path: ~/.codex/auth.json (written by `codex login`)
+ *
+ * @returns The Codex bearer token or empty string
+ */
+function loadCodexToken(): string {
+    if (process.env['OPENAI_CODEX_TOKEN']) {
+        return process.env['OPENAI_CODEX_TOKEN'];
+    }
+    try {
+        const authPath = process.env['OPENAI_CODEX_AUTH_PATH'] || join(homedir(), '.codex', 'auth.json');
+        if (existsSync(authPath)) {
+            const content = readFileSync(authPath, 'utf-8');
+            const auth = JSON.parse(content) as Record<string, unknown>;
+            // Current codex CLI stores token at tokens.access_token.
+            // Older/docs format used chatgpt_access_token — keep as fallback.
+            const tokensObj = auth['tokens'] as Record<string, unknown> | undefined;
+            const token = (tokensObj?.['access_token'] as string | undefined)
+                ?? (auth['chatgpt_access_token'] as string | undefined);
+            if (typeof token === 'string' && token.length > 0) {
+                return token;
+            }
+        }
+    } catch {
+        // Auth file not found or invalid
+    }
+    return '';
+}
+
+/**
  * Load API keys from environment variables.
  *
  * @returns Record of provider to API key
@@ -202,10 +243,13 @@ function loadApiKeys(): Record<ProviderType, string> {
     return {
         anthropic: process.env['ANTHROPIC_API_KEY'] ?? '',
         openai: process.env['OPENAI_API_KEY'] ?? '',
+        codex: loadCodexToken(),
         google: process.env['GOOGLE_API_KEY'] ?? '',
         deepseek: process.env['DEEPSEEK_API_KEY'] ?? '',
         openrouter: process.env['OPENROUTER_API_KEY'] ?? '',
         ollama: '', // Local — no API key required
+        'x-ai': process.env['XAI_API_KEY'] ?? '',
+        stepfun: process.env['STEPFUN_API_KEY'] ?? '',
     };
 }
 
@@ -233,7 +277,7 @@ function validateConfig(config: ClawRouteConfig): void {
     // Check for at least one API key
     if (!hasAnyApiKey(config.apiKeys)) {
         throw new Error(
-            'No API keys configured. Set at least one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, DEEPSEEK_API_KEY'
+            'No API keys configured. Set at least one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENAI_CODEX_TOKEN, GOOGLE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY (or run `codex login` for Codex subscription access)'
         );
     }
 
@@ -308,9 +352,24 @@ export function loadConfig(): ClawRouteConfig {
         config = deepMerge(config, userJson as Partial<ClawRouteConfig>);
     }
 
+    // Resolve provider profile: env var > JSON config > null
+    // This must happen AFTER the JSON files are merged so default.json's providerProfile is visible,
+    // but BEFORE env vars so CLAWROUTE_PROVIDER can still override it.
+    const resolvedProfile = process.env['CLAWROUTE_PROVIDER'] || (config.providerProfile ?? null);
+    if (resolvedProfile) {
+        const profilePath = join(projectRoot, 'config', 'providers', `${resolvedProfile}.json`);
+        const profileJson = loadJsonConfig(profilePath);
+        if (profileJson) {
+            config = deepMerge(config, profileJson as Partial<ClawRouteConfig>);
+        } else {
+            console.warn(`⚠️  Provider profile "${resolvedProfile}" not found at ${profilePath}. Ignoring.`);
+        }
+    }
+
     // Apply environment variable overrides
     config.enabled = parseBoolEnv(process.env['CLAWROUTE_ENABLED'], config.enabled);
     config.dryRun = parseBoolEnv(process.env['CLAWROUTE_DRY_RUN'], config.dryRun);
+    config.baselineModel = process.env['CLAWROUTE_BASELINE_MODEL'] || config.baselineModel;
     config.proxyPort = parseIntEnv(process.env['CLAWROUTE_PORT'], config.proxyPort);
 
     if (process.env['CLAWROUTE_HOST']) {
@@ -356,10 +415,13 @@ export function getRedactedConfig(
     const redactedKeys: Record<ProviderType, string> = {
         anthropic: config.apiKeys.anthropic ? '[REDACTED]' : '',
         openai: config.apiKeys.openai ? '[REDACTED]' : '',
+        codex: config.apiKeys.codex ? '[REDACTED]' : '',
         google: config.apiKeys.google ? '[REDACTED]' : '',
         deepseek: config.apiKeys.deepseek ? '[REDACTED]' : '',
         openrouter: config.apiKeys.openrouter ? '[REDACTED]' : '',
         ollama: '', // No API key for Ollama
+        'x-ai': config.apiKeys['x-ai'] ? '[REDACTED]' : '',
+        stepfun: config.apiKeys.stepfun ? '[REDACTED]' : '',
     };
 
     return {

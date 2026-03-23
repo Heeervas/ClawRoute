@@ -1,6 +1,8 @@
 {
     "enabled": true,
     "dryRun": false,
+    "providerProfile": "openrouter",
+    "baselineModel": "openrouter/anthropic/claude-sonnet-4.6",
     "proxyPort": 18790,
     "proxyHost": "127.0.0.1",
     "authToken": null,
@@ -16,28 +18,6 @@
         "onlyRetryBeforeStreaming": true,
         "onlyRetryWithoutToolCalls": false,
         "alwaysFallbackToOriginal": false
-    },
-    "models": {
-        "heartbeat": {
-            "primary": "openrouter/google/gemini-2.5-flash",
-            "fallback": "openrouter/google/gemini-2.5-flash"
-        },
-        "simple": {
-            "primary": "openrouter/google/gemini-2.5-flash",
-            "fallback": "openrouter/google/gemini-2.5-flash"
-        },
-        "moderate": {
-            "primary": "openrouter/google/gemini-2.5-flash",
-            "fallback": "openrouter/google/gemini-2.5-flash"
-        },
-        "complex": {
-            "primary": "openrouter/google/gemini-2.5-flash",
-            "fallback": "openrouter/google/gemini-2.5-flash"
-        },
-        "frontier": {
-            "primary": "openrouter/google/gemini-2.5-flash",
-            "fallback": "openrouter/google/gemini-2.5-flash"
-        }
     },
     "logging": {
         "dbPath": "./data/clawroute.db",

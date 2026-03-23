@@ -14,6 +14,26 @@ import { ModelEntry, ProviderType } from './types.js';
 export const DEFAULT_MODELS: ModelEntry[] = [
     // Ultra-cheap tier (heartbeat/simple)
     {
+        id: 'openrouter/stepfun/step-3.5-flash:free',
+        provider: 'openrouter',
+        inputCostPer1M: 0,
+        outputCostPer1M: 0,
+        maxContext: 32000,
+        toolCapable: true,
+        multimodal: false,
+        enabled: true,
+    },
+    {
+        id: 'openrouter/google/gemini-3.1-flash-lite-preview',
+        provider: 'openrouter',
+        inputCostPer1M: 0.25,
+        outputCostPer1M: 1.50,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    {
         id: 'google/gemini-2.5-flash-lite',
         provider: 'google',
         inputCostPer1M: 0.10,
@@ -48,15 +68,45 @@ export const DEFAULT_MODELS: ModelEntry[] = [
     {
         id: 'openai/gpt-5-mini',
         provider: 'openai',
-        inputCostPer1M: 0.25,
-        outputCostPer1M: 2.00,
+        inputCostPer1M: 0.15,
+        outputCostPer1M: 0.60,
         maxContext: 128000,
         toolCapable: true,
         multimodal: true,
         enabled: true,
     },
+    {
+        id: 'openrouter/x-ai/grok-4.1-fast',
+        provider: 'openrouter',
+        inputCostPer1M: 0.20,
+        outputCostPer1M: 0.50,
+        maxContext: 128000,
+        toolCapable: true,
+        multimodal: false,
+        enabled: true,
+    },
 
     // High-tier (complex)
+    {
+        id: 'openrouter/google/gemini-3.1-pro-preview',
+        provider: 'openrouter',
+        inputCostPer1M: 2.00,
+        outputCostPer1M: 12.00,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    {
+        id: 'openrouter/anthropic/claude-sonnet-4.6',
+        provider: 'openrouter',
+        inputCostPer1M: 3.00,
+        outputCostPer1M: 15.00,
+        maxContext: 200000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
     {
         id: 'anthropic/claude-sonnet-4-6',
         provider: 'anthropic',
@@ -114,8 +164,18 @@ export const DEFAULT_MODELS: ModelEntry[] = [
     {
         id: 'anthropic/claude-opus-4-6',
         provider: 'anthropic',
-        inputCostPer1M: 15.00,
-        outputCostPer1M: 75.00,
+        inputCostPer1M: 5.00,
+        outputCostPer1M: 25.00,
+        maxContext: 200000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    {
+        id: 'openrouter/anthropic/claude-opus-4.6',
+        provider: 'openrouter',
+        inputCostPer1M: 5.00,
+        outputCostPer1M: 25.00,
         maxContext: 200000,
         toolCapable: true,
         multimodal: true,
@@ -148,6 +208,51 @@ export const DEFAULT_MODELS: ModelEntry[] = [
         provider: 'openrouter',
         inputCostPer1M: 1.25,
         outputCostPer1M: 10.00,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+
+    // Codex subscription models (billed via ChatGPT Plus/Pro subscription, not per-token).
+    // Cost fields are $0 because subscription cost is flat; set non-zero only if you want
+    // ClawRoute's savings tracking to compare against a baseline.
+    {
+        id: 'codex/gpt-5.4-mini',
+        provider: 'codex',
+        inputCostPer1M: 0,
+        outputCostPer1M: 0,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    {
+        id: 'codex/gpt-5.4',
+        provider: 'codex',
+        inputCostPer1M: 0,
+        outputCostPer1M: 0,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    // Keep gpt-4.1 variants registered in case the subscription also allows them
+    {
+        id: 'codex/gpt-4.1-mini',
+        provider: 'codex',
+        inputCostPer1M: 0,
+        outputCostPer1M: 0,
+        maxContext: 1000000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
+    {
+        id: 'codex/gpt-4.1',
+        provider: 'codex',
+        inputCostPer1M: 0,
+        outputCostPer1M: 0,
         maxContext: 1000000,
         toolCapable: true,
         multimodal: true,
@@ -205,7 +310,7 @@ export function getProviderForModel(modelId: string): ProviderType {
     // Check if model ID has provider prefix
     if (modelId.includes('/')) {
         const prefix = modelId.split('/')[0]?.toLowerCase();
-        if (prefix === 'anthropic' || prefix === 'openai' || prefix === 'google' || prefix === 'deepseek' || prefix === 'openrouter' || prefix === 'ollama') {
+        if (prefix === 'anthropic' || prefix === 'openai' || prefix === 'codex' || prefix === 'google' || prefix === 'deepseek' || prefix === 'openrouter' || prefix === 'ollama' || prefix === 'x-ai' || prefix === 'stepfun') {
             return prefix as ProviderType;
         }
     }
@@ -265,10 +370,16 @@ export function getApiBaseUrl(provider: ProviderType): string {
             return 'https://api.anthropic.com/v1';
         case 'openai':
             return 'https://api.openai.com/v1';
+        case 'codex':
+            return 'https://chatgpt.com/backend-api/codex';
         case 'google':
             return 'https://generativelanguage.googleapis.com/v1beta/openai';
         case 'deepseek':
             return 'https://api.deepseek.com/v1';
+        case 'x-ai':
+            return 'https://api.x.ai/v1';
+        case 'stepfun':
+            return 'https://api.stepfun.com/v1';
         case 'openrouter':
             return 'https://openrouter.ai/api/v1';
         case 'ollama':
@@ -298,7 +409,10 @@ export function getAuthHeader(
                 'x-api-key': apiKey,
                 'anthropic-version': '2023-06-01',
             };
+        case 'x-ai':
+        case 'stepfun':
         case 'openai':
+        case 'codex':
         case 'deepseek':
         case 'openrouter':
         case 'google':

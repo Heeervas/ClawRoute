@@ -27,8 +27,17 @@ export function routeRequest(
     const originalModel = request.model;
     const estimatedTokens = estimateMessagesTokens(request.messages);
 
-    // Estimate output tokens (assume similar to input for estimation)
-    const estimatedOutputTokens = Math.min(estimatedTokens, 4000);
+    // Tier-aware output token estimates for cost reporting.
+    // Caps mirror what executor.ts injects as max_tokens per tier.
+    const ESTIMATED_OUTPUT_BY_TIER: Record<TaskTier, number> = {
+        [TaskTier.HEARTBEAT]: 100,
+        [TaskTier.SIMPLE]:    300,
+        [TaskTier.MODERATE]: 1000,
+        [TaskTier.COMPLEX]:         2500,
+        [TaskTier.FRONTIER_SONNET]: 3000,
+        [TaskTier.FRONTIER_OPUS]:   3000,
+    };
+    const estimatedOutputTokens = ESTIMATED_OUTPUT_BY_TIER[classification.tier] ?? 2000;
 
     // Default decision structure
     let routedModel = originalModel;
@@ -104,7 +113,8 @@ export function routeRequest(
     }
 
     // 6. Calculate estimated savings
-    const originalCost = calculateCost(originalModel, estimatedTokens, estimatedOutputTokens);
+    const comparisonModel = config.baselineModel || originalModel;
+    const originalCost = calculateCost(comparisonModel, estimatedTokens, estimatedOutputTokens);
     const routedCost = calculateCost(routedModel, estimatedTokens, estimatedOutputTokens);
     const estimatedSavingsUsd = Math.max(0, originalCost - routedCost);
 
@@ -138,7 +148,8 @@ export function getEscalatedModel(
         TaskTier.SIMPLE,
         TaskTier.MODERATE,
         TaskTier.COMPLEX,
-        TaskTier.FRONTIER,
+        TaskTier.FRONTIER_SONNET,
+        TaskTier.FRONTIER_OPUS,
     ];
 
     const currentIndex = tierOrder.indexOf(currentTier);
@@ -239,8 +250,9 @@ export function getModelMap(config: ClawRouteConfig): Record<TaskTier, string> {
         [TaskTier.HEARTBEAT]: config.models[TaskTier.HEARTBEAT]?.primary ?? 'unknown',
         [TaskTier.SIMPLE]: config.models[TaskTier.SIMPLE]?.primary ?? 'unknown',
         [TaskTier.MODERATE]: config.models[TaskTier.MODERATE]?.primary ?? 'unknown',
-        [TaskTier.COMPLEX]: config.models[TaskTier.COMPLEX]?.primary ?? 'unknown',
-        [TaskTier.FRONTIER]: config.models[TaskTier.FRONTIER]?.primary ?? 'unknown',
+        [TaskTier.COMPLEX]:         config.models[TaskTier.COMPLEX]?.primary         ?? 'unknown',
+        [TaskTier.FRONTIER_SONNET]: config.models[TaskTier.FRONTIER_SONNET]?.primary ?? 'unknown',
+        [TaskTier.FRONTIER_OPUS]:   config.models[TaskTier.FRONTIER_OPUS]?.primary   ?? 'unknown',
     };
 
     return map;

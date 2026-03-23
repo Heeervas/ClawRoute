@@ -21,6 +21,7 @@ import { getApiKey } from './config.js';
 import { getEscalatedModel } from './router.js';
 import { validateResponse } from './validator.js';
 import { pipeStream, pipeOllamaStream, adaptOllamaResponse, getSSEHeaders, StreamResult } from './streaming.js';
+import { makeCodexRequest } from './codex-transport.js';
 import { ProxyAgent } from 'undici';
 
 // Lazily-created proxy agent for external LLM API calls.
@@ -64,6 +65,22 @@ export async function executeRequest(
     config: ClawRouteConfig
 ): Promise<ExecutionResult> {
     const startTime = Date.now();
+
+    // Guard: if the router couldn't find API keys and fell through to passthrough,
+    // the routedModel is the raw client model (e.g. 'clawroute/auto') which has no
+    // real provider. Return a clear 503 instead of crashing into the OpenAI endpoint.
+    if (routingDecision.isPassthrough && routingDecision.routedModel.startsWith('clawroute/')) {
+        const profile = config.providerProfile ?? 'unknown';
+        const errResponse = createErrorResponse(
+            `No API keys found for provider profile "${profile}". ` +
+            `Check OPENAI_CODEX_TOKEN, OPENAI_CODEX_AUTH_PATH, or OPENROUTER_API_KEY.`
+        );
+        return buildExecutionResult(
+            errResponse, routingDecision, routingDecision.routedModel,
+            false, [routingDecision.routedModel], 0, 0, false, startTime, config
+        );
+    }
+
     const escalationChain: string[] = [];
     let currentModel = routingDecision.routedModel;
     let escalated = false;
@@ -243,7 +260,8 @@ export async function executeRequest(
                 inputTokens,
                 outputTokens,
                 hadToolCalls,
-                startTime
+                startTime,
+                config
             );
 
             // Start piping in the background
@@ -265,7 +283,9 @@ export async function executeRequest(
                 execResult.inputTokens = inputTokens;
                 execResult.outputTokens = outputTokens;
                 execResult.hadToolCalls = hadToolCalls;
-                execResult.originalCostUsd = calculateCost(routingDecision.originalModel, inputTokens, outputTokens);
+                
+                const comparisonModel = config.baselineModel || routingDecision.originalModel;
+                execResult.originalCostUsd = calculateCost(comparisonModel, inputTokens, outputTokens);
                 execResult.actualCostUsd = calculateCost(currentModel, inputTokens, outputTokens);
                 execResult.savingsUsd = Math.max(0, execResult.originalCostUsd - execResult.actualCostUsd);
                 execResult.logWhenDone?.();
@@ -297,7 +317,8 @@ export async function executeRequest(
             inputTokens,
             outputTokens,
             hadToolCalls,
-            startTime
+            startTime,
+            config
         );
     } else {
         // NON-STREAMING REQUEST
@@ -465,7 +486,8 @@ export async function executeRequest(
             inputTokens,
             outputTokens,
             hadToolCalls,
-            startTime
+            startTime,
+            config
         );
     }
 }
@@ -480,6 +502,15 @@ async function makeProviderRequest(
     tier?: TaskTier
 ): Promise<Response> {
     const provider = getProviderForModel(modelId);
+
+    // Codex uses a different protocol (Responses API via chatgpt.com) — delegate entirely.
+    // The codex-transport handles its own auth (OAuth), request/response translation,
+    // and returns a standard Chat Completions Response so the rest of the pipeline works.
+    if (provider === 'codex') {
+        const proxyAgent = getProxyAgent();
+        return makeCodexRequest(request as Record<string, unknown>, modelId, proxyAgent);
+    }
+
     const apiKey = getApiKey(config, provider);
 
     // Ollama is local — no API key required
@@ -537,6 +568,57 @@ async function makeProviderRequest(
             body['messages'] = flattenContent([...systemMsgs, ...trimmed]);
         } else {
             body['messages'] = flattenContent(request.messages);
+        }
+    }
+
+    // === Cost-optimization injections (non-Ollama only) ===
+
+    if (provider !== 'ollama') {
+        // 1. Per-tier max_tokens cap — output tokens are 5-15x more expensive than input.
+        //    Only inject when the client hasn't already set a cap.
+        //    Sized to fit tool responses (JSON blobs, file reads, etc.) at each tier.
+        //    COMPLEX, FRONTIER_SONNET, and FRONTIER_OPUS are intentionally uncapped — they need full output length.
+        const TIER_MAX_OUTPUT: Partial<Record<TaskTier, number>> = {
+            [TaskTier.HEARTBEAT]: 256,
+            [TaskTier.SIMPLE]:    800,
+            [TaskTier.MODERATE]: 4096,
+        };
+        if (tier && !body['max_tokens']) {
+            const cap = TIER_MAX_OUTPUT[tier];
+            if (cap !== undefined) {
+                body['max_tokens'] = cap;
+            }
+        }
+
+        // 2. For heartbeat/simple on OpenRouter: sort by price to always pick cheapest provider.
+        //    Don't apply to moderate+ where uptime/load balancing matters more.
+        if (provider === 'openrouter' && !body['provider']) {
+            if (tier === TaskTier.HEARTBEAT || tier === TaskTier.SIMPLE) {
+                body['provider'] = { sort: 'price', allow_fallbacks: true };
+            }
+        }
+
+        // 3. Anthropic automatic prompt caching via top-level cache_control.
+        //    Cache reads cost 0.1x input price (90% discount).
+        //    Only applies when: routed through OpenRouter to a Claude model, multi-turn
+        //    conversation with enough context to meet Anthropic's minimum (2048 tokens).
+        if (provider === 'openrouter' && !body['cache_control']) {
+            const modelName = extractModelName(modelId).toLowerCase();
+            if (modelName.includes('claude')) {
+                const msgs = request.messages;
+                const estimatedCtxTokens = estimateMessagesTokens(msgs);
+                // Per-model minimum tokens required for Anthropic prompt caching:
+                //   Claude Opus 4.6/4.5, Haiku 4.5 → 4096
+                //   Claude Sonnet 4.6, Haiku 3.5   → 2048
+                //   All older Sonnet/Opus models    → 1024
+                const cachingMinTokens =
+                    /opus-4[-.](?:5|6)|haiku-4[-.]5/.test(modelName) ? 4096 :
+                    /sonnet-4[-.]6|haiku-3[-.]5/.test(modelName)     ? 2048 :
+                    1024;
+                if (msgs.length >= 3 && estimatedCtxTokens >= cachingMinTokens) {
+                    body['cache_control'] = { type: 'ephemeral' };
+                }
+            }
         }
     }
 
@@ -683,12 +765,14 @@ function buildExecutionResult(
     inputTokens: number,
     outputTokens: number,
     hadToolCalls: boolean,
-    startTime: number
+    startTime: number,
+    config: ClawRouteConfig
 ): ExecutionResult {
     const responseTimeMs = Date.now() - startTime;
 
+    const comparisonModel = config.baselineModel || routingDecision.originalModel;
     const originalCostUsd = calculateCost(
-        routingDecision.originalModel,
+        comparisonModel,
         inputTokens,
         outputTokens
     );
