@@ -9,7 +9,8 @@
  * - SIMPLE: acknowledgments, short replies, brief questions
  * - MODERATE: general conversation — the wide default bucket
  * - COMPLEX: clear analytical/technical tasks
- * - FRONTIER: explicit user opt-in only ("use frontier" / "#frontier")
+ * - FRONTIER_OPUS:   explicit user opt-in only ("#frontier-opus")
+ * - FRONTIER_SONNET: explicit user opt-in only ("#frontier" /"#frontier-sonnet")
  *
  * Design goals for OpenClaw:
  * - OpenClaw always sends 17 tool schemas → tools alone are NOT a signal
@@ -33,19 +34,17 @@ import {
 
 /** * Explicit tier override hashtags — highest priority, short-circuit all heuristics.
  * #mode-simple | #mode-moderate | #mode-complex | #mode-frontier
- * Also accepts the legacy aliases: #frontier / "use frontier" for frontier.
+ * Also accepts the legacy aliases: #frontier → FRONTIER_OPUS.
  */
 const MODE_TAG: Record<string, TaskTier> = {
-    'mode-simple':   TaskTier.SIMPLE,
-    'mode-moderate': TaskTier.MODERATE,
-    'mode-complex':  TaskTier.COMPLEX,
-    'mode-frontier': TaskTier.FRONTIER,
+    'mode-simple':          TaskTier.SIMPLE,
+    'mode-moderate':        TaskTier.MODERATE,
+    'mode-complex':         TaskTier.COMPLEX,
+    'mode-frontier':        TaskTier.FRONTIER_OPUS,
+    'mode-frontier-opus':   TaskTier.FRONTIER_OPUS,
+    'mode-frontier-sonnet': TaskTier.FRONTIER_SONNET,
 };
-const MODE_TAG_PATTERN = /#(mode-simple|mode-moderate|mode-complex|mode-frontier)\b/i;
-
-/** * Explicit opt-in to frontier tier. User must include one of these phrases.
- */
-const FRONTIER_EXPLICIT = /\buse frontier\b|#frontier\b/i;
+const MODE_TAG_PATTERN = /#(mode-simple|mode-moderate|mode-complex|mode-frontier-opus|mode-frontier-sonnet|mode-frontier)\b/i;
 
 /**
  * Patterns for heartbeat/ping detection.
@@ -90,16 +89,21 @@ const TECHNICAL_NOUN =
 // === Classification Functions ===
 
 /**
- * FRONTIER: explicit opt-in only.
- * User must write "use frontier" or "#frontier" in their message.
+ * FRONTIER_OPUS / FRONTIER_SONNET: explicit opt-in only.
+ * Returns which frontier tier the user requested:
+ *   #frontier-sonnet | #frontier              → FRONTIER_SONNET
+ *   #frontier-opus     → FRONTIER_OPUS (default)
  */
 function isFrontier(
     lastMessage: string
-): { match: boolean; confidence: number; signals: string[] } {
-    if (FRONTIER_EXPLICIT.test(lastMessage)) {
-        return { match: true, confidence: 0.99, signals: ['explicit_opt_in'] };
+): { match: boolean; tier: TaskTier; confidence: number; signals: string[] } {
+    if (/#frontier-sonnet\b|#frontier\b/i.test(lastMessage)) {
+        return { match: true, tier: TaskTier.FRONTIER_SONNET, confidence: 0.99, signals: ['explicit_opt_in'] };
     }
-    return { match: false, confidence: 0, signals: [] };
+    if (/#frontier-opus\b/i.test(lastMessage)) {
+        return { match: true, tier: TaskTier.FRONTIER_OPUS, confidence: 0.99, signals: ['explicit_opt_in'] };
+    }
+    return { match: false, tier: TaskTier.MODERATE, confidence: 0, signals: [] };
 }
 
 /**
@@ -264,10 +268,10 @@ export function classifyRequest(
         }
     }
 
-    // RULE GROUP 4: FRONTIER — explicit opt-in only; overrides all tiers
+    // RULE GROUP 4: FRONTIER_OPUS / FRONTIER_SONNET — explicit opt-in only; overrides all tiers
     const frontierCheck = isFrontier(lastMessage);
     if (frontierCheck.match) {
-        tier = TaskTier.FRONTIER;
+        tier = frontierCheck.tier;
         confidence = frontierCheck.confidence;
         reason = `frontier: ${frontierCheck.signals.join(', ')}`;
         signals.push(...frontierCheck.signals);
@@ -304,10 +308,10 @@ export function classifyRequest(
         if (confidence < config.classification.minConfidence) {
             // Escalate one tier
             const currentOrder = TIER_ORDER[tier];
-            const nextOrder = Math.min(currentOrder + 1, TIER_ORDER[TaskTier.FRONTIER]);
+            const nextOrder = Math.min(currentOrder + 1, TIER_ORDER[TaskTier.FRONTIER_OPUS]);
             const nextTier = (Object.entries(TIER_ORDER).find(
                 ([, order]) => order === nextOrder
-            )?.[0] ?? TaskTier.FRONTIER) as TaskTier;
+)?.[0] ?? TaskTier.FRONTIER_OPUS) as TaskTier;
 
             if (nextTier !== tier) {
                 const oldTier = tier;
@@ -318,8 +322,8 @@ export function classifyRequest(
         }
 
         // Very low confidence -> escalate to frontier
-        if (confidence < 0.5 && tier !== TaskTier.FRONTIER) {
-            tier = TaskTier.FRONTIER;
+        if (confidence < 0.5 && tier !== TaskTier.FRONTIER_OPUS) {
+            tier = TaskTier.FRONTIER_OPUS;
             reason = `escalated to frontier: very low confidence (${confidence.toFixed(2)})`;
             signals.push('very_low_confidence_escalation');
         }
@@ -356,8 +360,8 @@ export function explainClassification(result: ClassificationResult): string {
         [TaskTier.SIMPLE]: 'Simple (acknowledgment/short question)',
         [TaskTier.MODERATE]: 'Moderate (general conversation)',
         [TaskTier.COMPLEX]: 'Complex (analytical/tools)',
-        [TaskTier.FRONTIER]: 'Frontier (explicit opt-in)',
-
+        [TaskTier.FRONTIER_SONNET]: 'Frontier Sonnet (explicit opt-in)',
+        [TaskTier.FRONTIER_OPUS]: 'Frontier Opus (explicit opt-in)',
     };
 
     return `${tierNames[result.tier]} - ${result.reason} (confidence: ${(result.confidence * 100).toFixed(0)}%)`;
