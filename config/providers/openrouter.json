@@ -1,0 +1,29 @@
+{
+    "baselineModel": "openrouter/anthropic/claude-sonnet-4.6",
+    "models": {
+        "heartbeat": {
+            "primary": "openrouter/stepfun/step-3.5-flash:free",
+            "fallback": "openrouter/google/gemini-3.1-flash-lite-preview"
+        },
+        "simple": {
+            "primary": "openrouter/stepfun/step-3.5-flash:free",
+            "fallback": "openrouter/google/gemini-3.1-flash-lite-preview"
+        },
+        "moderate": {
+            "primary": "openrouter/google/gemini-3.1-flash-lite-preview",
+            "fallback": "openrouter/x-ai/grok-4.1-fast"
+        },
+        "complex": {
+            "primary": "openrouter/google/gemini-3.1-flash-lite-preview",
+            "fallback": "openrouter/x-ai/grok-4.1-fast"
+        },
+        "frontier-sonnet": {
+            "primary": "openrouter/anthropic/claude-sonnet-4.6",
+            "fallback": "openrouter/anthropic/claude-haiku-4.5"
+        },
+        "frontier-opus": {
+            "primary": "openrouter/anthropic/claude-opus-4.6",
+            "fallback": "openrouter/anthropic/claude-sonnet-4.6"
+        }
+    }
+}

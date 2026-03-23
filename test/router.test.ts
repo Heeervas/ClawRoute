@@ -31,7 +31,8 @@ function createTestConfig(overrides: Partial<ClawRouteConfig> = {}): ClawRouteCo
             [TaskTier.SIMPLE]: { primary: 'deepseek/deepseek-chat', fallback: 'google/gemini-2.5-flash' },
             [TaskTier.MODERATE]: { primary: 'google/gemini-2.5-flash', fallback: 'openai/gpt-4o-mini' },
             [TaskTier.COMPLEX]: { primary: 'anthropic/claude-sonnet-4-5', fallback: 'openai/gpt-4o' },
-            [TaskTier.FRONTIER]: { primary: 'anthropic/claude-sonnet-4-5', fallback: 'openai/gpt-4o' },
+            [TaskTier.FRONTIER_SONNET]: { primary: 'anthropic/claude-sonnet-4-5', fallback: 'openai/gpt-4o' },
+            [TaskTier.FRONTIER_OPUS]:   { primary: 'anthropic/claude-sonnet-4-5', fallback: 'openai/gpt-4o' },
         },
         logging: {
             dbPath: ':memory:',
@@ -249,11 +250,11 @@ describe('Router', () => {
         it('should return fallback at max tier', () => {
             const config = createTestConfig();
 
-            const result = getEscalatedModel(TaskTier.FRONTIER, config);
+            const result = getEscalatedModel(TaskTier.FRONTIER_OPUS, config);
 
             // Now tries the tier's own fallback instead of returning null
             expect(result).not.toBeNull();
-            expect(result?.tier).toBe(TaskTier.FRONTIER);
+            expect(result?.tier).toBe(TaskTier.FRONTIER_OPUS);
             expect(result?.model).toBe('openai/gpt-4o');
         });
 
@@ -269,7 +270,7 @@ describe('Router', () => {
                 },
             });
 
-            const result = getEscalatedModel(TaskTier.FRONTIER, config);
+            const result = getEscalatedModel(TaskTier.FRONTIER_OPUS, config);
 
             expect(result).toBeNull();
         });
@@ -306,6 +307,64 @@ describe('Router', () => {
 
             expect(map[TaskTier.HEARTBEAT]).toBe('google/gemini-2.5-flash-lite');
             expect(map[TaskTier.COMPLEX]).toBe('anthropic/claude-sonnet-4-5');
+        });
+    });
+
+    describe('Tier-Aware Output Estimation', () => {
+        it('should produce higher estimated savings for complex tier than heartbeat (same routed model)', () => {
+            // Both tiers route to the same cheap model (deepseek), but the output token
+            // estimate differs: heartbeat=100, complex=2500. Since output tokens are much
+            // more expensive than input, complex should show ~25x more estimated savings.
+            const config = createTestConfig({
+                models: {
+                    [TaskTier.HEARTBEAT]: { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.SIMPLE]:    { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.MODERATE]:  { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.COMPLEX]:   { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.FRONTIER_SONNET]: { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.FRONTIER_OPUS]:   { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                },
+            });
+
+            // Use an expensive original model so savings vs deepseek are meaningful
+            const request = createRequest('anthropic/claude-sonnet-4-5');
+            const heartbeat = routeRequest(request, createClassification(TaskTier.HEARTBEAT), config);
+            const complex  = routeRequest(request, createClassification(TaskTier.COMPLEX),   config);
+
+            // Both should save money (routing to cheap deepseek)
+            expect(heartbeat.estimatedSavingsUsd).toBeGreaterThan(0);
+            expect(complex.estimatedSavingsUsd).toBeGreaterThan(0);
+
+            // Complex estimate uses 2500 output tokens vs heartbeat's 100 — savings should be
+            // substantially higher (at least 5x, actually ~25x given $13.88 output diff/M)
+            expect(complex.estimatedSavingsUsd).toBeGreaterThan(heartbeat.estimatedSavingsUsd * 5);
+        });
+
+        it('should not use flat 4000 output estimate for cheap tiers', () => {
+            // With a SHORT message, old code gave estimatedOutput = Math.min(~5, 4000) = ~5 for all tiers.
+            // New code gives 100 for heartbeat and 1000 for moderate.
+            // Input tokens are tiny (~5) so output dominates the savings calculation →
+            // moderate savings should be substantially larger than heartbeat savings.
+            const config = createTestConfig({
+                models: {
+                    [TaskTier.HEARTBEAT]: { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.SIMPLE]:    { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.MODERATE]:  { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.COMPLEX]:   { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.FRONTIER_SONNET]: { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                    [TaskTier.FRONTIER_OPUS]:   { primary: 'deepseek/deepseek-chat', fallback: 'deepseek/deepseek-chat' },
+                },
+            });
+
+            // Very SHORT message — input tokens are negligible, output estimate dominates
+            const shortRequest = createRequest('anthropic/claude-sonnet-4-5');
+
+            const heartbeatShort  = routeRequest(shortRequest, createClassification(TaskTier.HEARTBEAT),  config);
+            const moderateShort   = routeRequest(shortRequest, createClassification(TaskTier.MODERATE),   config);
+
+            // Moderate output estimate (1000) is 10x heartbeat (100) →
+            // savings should be substantially higher for moderate
+            expect(moderateShort.estimatedSavingsUsd).toBeGreaterThan(heartbeatShort.estimatedSavingsUsd * 5);
         });
     });
 });

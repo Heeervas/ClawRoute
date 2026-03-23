@@ -16,7 +16,8 @@ export enum TaskTier {
     SIMPLE = 'simple',
     MODERATE = 'moderate',
     COMPLEX = 'complex',
-    FRONTIER = 'frontier',
+    FRONTIER_SONNET = 'frontier-sonnet',
+    FRONTIER_OPUS   = 'frontier-opus',
 }
 
 /**
@@ -27,8 +28,9 @@ export const TIER_ORDER: Record<TaskTier, number> = {
     [TaskTier.HEARTBEAT]: 0,
     [TaskTier.SIMPLE]: 1,
     [TaskTier.MODERATE]: 2,
-    [TaskTier.COMPLEX]: 3,
-    [TaskTier.FRONTIER]: 4,
+    [TaskTier.COMPLEX]:         3,
+    [TaskTier.FRONTIER_SONNET]: 4,
+    [TaskTier.FRONTIER_OPUS]:   5,
 };
 
 /**
@@ -54,7 +56,7 @@ export interface ClassificationResult {
 /**
  * Supported LLM providers.
  */
-export type ProviderType = 'anthropic' | 'openai' | 'google' | 'deepseek' | 'openrouter' | 'ollama';
+export type ProviderType = 'anthropic' | 'openai' | 'codex' | 'google' | 'deepseek' | 'openrouter' | 'ollama' | 'x-ai' | 'stepfun';
 
 /**
  * Model entry with cost and capability information.
@@ -176,6 +178,15 @@ export interface ClawRouteConfig {
     enabled: boolean;
     /** Dry-run mode: classify + log, but use original model */
     dryRun: boolean;
+    /** The fallback model to use for savings comparison if the request doesn't specify an original cost */
+    baselineModel: string;
+    /**
+     * Provider profile to load from config/providers/<name>.json.
+     * Sets all tier model mappings in one field.
+     * Overridden by CLAWROUTE_PROVIDER env var.
+     * Built-in profiles: openrouter | codex | anthropic | openai
+     */
+    providerProfile: string | null;
     /** Port to listen on */
     proxyPort: number;
     /** Host to bind to (always 127.0.0.1 by default) */

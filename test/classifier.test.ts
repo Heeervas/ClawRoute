@@ -35,7 +35,8 @@ function createTestConfig(): ClawRouteConfig {
             [TaskTier.SIMPLE]: { primary: 'test/simple', fallback: 'test/fallback' },
             [TaskTier.MODERATE]: { primary: 'test/moderate', fallback: 'test/fallback' },
             [TaskTier.COMPLEX]: { primary: 'test/complex', fallback: 'test/fallback' },
-            [TaskTier.FRONTIER]: { primary: 'test/frontier', fallback: 'test/fallback' },
+            [TaskTier.FRONTIER_SONNET]: { primary: 'test/frontier-sonnet', fallback: 'test/fallback' },
+            [TaskTier.FRONTIER_OPUS]:   { primary: 'test/frontier-opus',   fallback: 'test/fallback' },
         },
         logging: {
             dbPath: ':memory:',
@@ -201,7 +202,8 @@ describe('Classifier', () => {
             // Code block is present but no frontier verb+noun pair → should NOT be frontier
             const message = 'Please review this code:\n```python\ndef hello():\n    print("hello")\n```';
             const result = classifyRequest(createRequest(message), config);
-            expect(result.tier).not.toBe(TaskTier.FRONTIER);
+            expect(result.tier).not.toBe(TaskTier.FRONTIER_SONNET);
+            expect(result.tier).not.toBe(TaskTier.FRONTIER_OPUS);
         });
 
         it('should classify "implement a binary search tree in TypeScript" with context as complex/frontier', () => {
@@ -211,7 +213,7 @@ describe('Classifier', () => {
                 'Make sure to add comprehensive error handling and type safety.';
             const result = classifyRequest(createRequest(longMessage), config);
             // Should be at least COMPLEX due to keywords
-            expect([TaskTier.COMPLEX, TaskTier.FRONTIER]).toContain(result.tier);
+            expect([TaskTier.COMPLEX, TaskTier.FRONTIER_SONNET, TaskTier.FRONTIER_OPUS]).toContain(result.tier);
         });
 
         it('should classify very long message as complex (not frontier — explicit opt-in only)', () => {

@@ -61,11 +61,9 @@ export function createApp(config: ClawRouteConfig): Hono {
     });
 
     // Dashboard (v2.0)
-    app.get('/dashboard', (c) => {
+    app.get('/dashboard2', (c) => {
         try {
-            // Version choice — defaults to v2 for performance
-            const version = c.req.query('v') || '2';
-            const filename = version === '1' ? 'dashboard.html' : 'dashboard2.html';
+            const filename = 'dashboard2.html';
             
             // Try to load from web/ directory
             const dashboardPath = join(__dirname, '..', 'web', filename);
@@ -81,7 +79,32 @@ export function createApp(config: ClawRouteConfig): Hono {
                 return c.html(html);
             }
 
-            return c.html(`<html><body><h1>Dashboard ${version} not found</h1><p>Expected file: web/${filename}</p></body></html>`);
+            return c.html(`<html><body><h1>Dashboard v2 not found</h1><p>Expected file: web/${filename}</p></body></html>`);
+        } catch (error) {
+            return c.html('<html><body><h1>Error loading dashboard</h1></body></html>');
+        }
+    });
+
+    // Legacy Dashboard (v1.0)
+    app.get('/dashboard', (c) => {
+        try {
+            const filename = 'dashboard.html';
+            
+            // Try to load from web/ directory
+            const dashboardPath = join(__dirname, '..', 'web', filename);
+            if (existsSync(dashboardPath)) {
+                const html = readFileSync(dashboardPath, 'utf-8');
+                return c.html(html);
+            }
+
+            // Fallback: try dist/web
+            const distPath = join(__dirname, '..', 'dist', 'web', filename);
+            if (existsSync(distPath)) {
+                const html = readFileSync(distPath, 'utf-8');
+                return c.html(html);
+            }
+
+            return c.html(`<html><body><h1>Dashboard v1 not found</h1><p>Expected file: web/${filename}</p></body></html>`);
         } catch (error) {
             return c.html('<html><body><h1>Error loading dashboard</h1></body></html>');
         }

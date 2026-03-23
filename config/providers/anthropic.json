@@ -1,0 +1,29 @@
+{
+    "baselineModel": "openrouter/anthropic/claude-sonnet-4.6",
+    "models": {
+        "heartbeat": {
+            "primary": "anthropic/claude-haiku-4-5",
+            "fallback": "anthropic/claude-haiku-4-5"
+        },
+        "simple": {
+            "primary": "anthropic/claude-haiku-4-5",
+            "fallback": "anthropic/claude-haiku-4-5"
+        },
+        "moderate": {
+            "primary": "anthropic/claude-haiku-4-5",
+            "fallback": "anthropic/claude-sonnet-4-6"
+        },
+        "complex": {
+            "primary": "anthropic/claude-sonnet-4-6",
+            "fallback": "anthropic/claude-haiku-4-5"
+        },
+        "frontier-sonnet": {
+            "primary": "anthropic/claude-sonnet-4-6",
+            "fallback": "anthropic/claude-haiku-4-5"
+        },
+        "frontier-opus": {
+            "primary": "anthropic/claude-opus-4-6",
+            "fallback": "anthropic/claude-sonnet-4-6"
+        }
+    }
+}

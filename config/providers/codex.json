@@ -1,0 +1,29 @@
+{
+    "baselineModel": "codex/gpt-5.4",
+    "models": {
+        "heartbeat": {
+            "primary": "codex/gpt-5.4-mini",
+            "fallback": "codex/gpt-5.4-mini"
+        },
+        "simple": {
+            "primary": "codex/gpt-5.4-mini",
+            "fallback": "codex/gpt-5.4-mini"
+        },
+        "moderate": {
+            "primary": "codex/gpt-5.4",
+            "fallback": "codex/gpt-5.3-codex"
+        },
+        "complex": {
+            "primary": "codex/gpt-5.4",
+            "fallback": "codex/gpt-5.3-codex"
+        },
+        "frontier-sonnet": {
+            "primary": "codex/gpt-5.4",
+            "fallback": "codex/gpt-5.3-codex"
+        },
+        "frontier-opus": {
+            "primary": "codex/gpt-5.4",
+            "fallback": "codex/gpt-5.3-codex"
+        }
+    }
+}

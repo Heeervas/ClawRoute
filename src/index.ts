@@ -38,7 +38,8 @@ function printBanner(config: ReturnType<typeof loadConfig>): void {
 ║    Simple    → ${(config.models[TaskTier.SIMPLE]?.primary ?? 'N/A').padEnd(30)}    ║
 ║    Moderate  → ${(config.models[TaskTier.MODERATE]?.primary ?? 'N/A').padEnd(30)}    ║
 ║    Complex   → ${(config.models[TaskTier.COMPLEX]?.primary ?? 'N/A').padEnd(30)}    ║
-║    Frontier  → ${(config.models[TaskTier.FRONTIER]?.primary ?? 'N/A').padEnd(30)}    ║
+║    Frontier  → ${(config.models[TaskTier.FRONTIER_SONNET]?.primary ?? 'N/A').padEnd(30)} (Sonnet) ║
+║               ${(config.models[TaskTier.FRONTIER_OPUS]?.primary   ?? 'N/A').padEnd(30)} (Opus)   ║
 ╚═══════════════════════════════════════════════════════╝
 `);
 }

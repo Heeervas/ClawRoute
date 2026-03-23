@@ -1,0 +1,29 @@
+{
+    "baselineModel": "openrouter/anthropic/claude-sonnet-4.6",
+    "models": {
+        "heartbeat": {
+            "primary": "openai/gpt-4.1-mini",
+            "fallback": "openai/gpt-4.1-mini"
+        },
+        "simple": {
+            "primary": "openai/gpt-4.1-mini",
+            "fallback": "openai/gpt-4.1-mini"
+        },
+        "moderate": {
+            "primary": "openai/gpt-4.1-mini",
+            "fallback": "openai/gpt-4.1"
+        },
+        "complex": {
+            "primary": "openai/gpt-4.1",
+            "fallback": "openai/gpt-4.1-mini"
+        },
+        "frontier-sonnet": {
+            "primary": "openai/gpt-4.1",
+            "fallback": "openai/gpt-4.1-mini"
+        },
+        "frontier-opus": {
+            "primary": "openai/o3",
+            "fallback": "openai/gpt-4.1"
+        }
+    }
+}

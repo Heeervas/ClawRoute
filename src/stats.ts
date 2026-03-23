@@ -24,7 +24,8 @@ function emptyPeriodStats(): PeriodStats {
             [TaskTier.SIMPLE]: 0,
             [TaskTier.MODERATE]: 0,
             [TaskTier.COMPLEX]: 0,
-            [TaskTier.FRONTIER]: 0,
+            [TaskTier.FRONTIER_SONNET]: 0,
+            [TaskTier.FRONTIER_OPUS]:   0,
         },
         escalations: 0,
         dryRunRequests: 0,
@@ -196,7 +197,7 @@ export function formatStatsForCli(
         '│                                     │',
     ];
 
-    for (const tier of [TaskTier.HEARTBEAT, TaskTier.SIMPLE, TaskTier.MODERATE, TaskTier.COMPLEX, TaskTier.FRONTIER]) {
+    for (const tier of [TaskTier.HEARTBEAT, TaskTier.SIMPLE, TaskTier.MODERATE, TaskTier.COMPLEX, TaskTier.FRONTIER_SONNET, TaskTier.FRONTIER_OPUS]) {
         const count = periodStats.tierBreakdown[tier];
         const model = stats.config.modelMap[tier] ?? 'unknown';
         const shortModel = model.split('/').pop() ?? model;
