@@ -256,6 +256,9 @@ export interface ClawRouteConfig {
 
     /** Alerts configuration (v1.1) */
     alerts: AlertsConfig;
+
+    /** Per-model maxContext overrides — model ID → token limit */
+    contextOverrides?: Record<string, number>;
 }
 
 // === LLM API Types (OpenAI-compatible) ===

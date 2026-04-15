@@ -28,5 +28,11 @@
     },
     "dashboard": {
         "enabled": true
+    },
+    "contextOverrides": {
+        "codex/gpt-5.4": 256000,
+        "codex/gpt-5.4-mini": 256000,
+        "codex/gpt-4.1": 256000,
+        "codex/gpt-4.1-mini": 256000
     }
 }

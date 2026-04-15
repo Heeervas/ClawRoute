@@ -451,3 +451,44 @@ export function registerModel(model: ModelEntry): void {
 export function getAllModels(): ModelEntry[] {
     return Array.from(modelRegistry.values());
 }
+
+/**
+ * Get only enabled models from the registry.
+ */
+export function getEnabledModels(): ModelEntry[] {
+    return getAllModels().filter(m => m.enabled);
+}
+
+/**
+ * Get a model entry by exact or prefix match only (no fuzzy).
+ * Used by API endpoints where fuzzy matching could be misleading.
+ */
+export function getModelEntryStrict(modelId: string): ModelEntry | null {
+    // Exact match
+    const exact = modelRegistry.get(modelId);
+    if (exact) return exact;
+
+    // Try without provider prefix (e.g., "google/gemini-2.5-flash" matches "openrouter/google/gemini-2.5-flash")
+    for (const [id, entry] of modelRegistry) {
+        if (id.endsWith(`/${modelId}`) || modelId.endsWith(`/${id.split('/')[1]}`)) {
+            return entry;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Apply maxContext overrides to the model registry.
+ * Called once at startup from config loading.
+ */
+export function applyContextOverrides(overrides: Record<string, number>): void {
+    for (const [modelId, maxContext] of Object.entries(overrides)) {
+        const entry = modelRegistry.get(modelId);
+        if (entry) {
+            entry.maxContext = maxContext;
+        } else {
+            console.warn(`contextOverrides: unknown model "${modelId}", skipping`);
+        }
+    }
+}

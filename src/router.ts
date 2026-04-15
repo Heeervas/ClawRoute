@@ -6,7 +6,7 @@ import {
     TaskTier,
 } from './types.js';
 import { hasApiKey } from './config.js';
-import { calculateCost, getProviderForModel } from './models.js';
+import { calculateCost, getModelEntryStrict, getProviderForModel } from './models.js';
 import { estimateMessagesTokens } from './utils.js';
 
 
@@ -74,6 +74,20 @@ export function routeRequest(
 
     // 4. Normal routing based on tier (if no override)
     if (!isOverride) {
+        // 3b. Client-specified model bypass (skip for clawroute/* models)
+        if (!request.model.startsWith('clawroute/')) {
+            const entry = getModelEntryStrict(request.model);
+            if (entry && entry.enabled) {
+                const provider = getProviderForModel(request.model);
+                if (hasApiKey(config, provider)) {
+                    routedModel = request.model;
+                    reason = `client-specified: ${request.model}`;
+                }
+            }
+        }
+
+        // Normal tier routing (only if bypass didn't match)
+        if (reason === 'passthrough') {
         const tier = classification.tier;
         const tierConfig = config.models[tier];
 
@@ -103,6 +117,7 @@ export function routeRequest(
             reason = `tier ${tier}: no config, passthrough`;
             isPassthrough = true;
         }
+        } // end tier routing guard
     }
 
     // 5. Dry-run mode: use original model but log what would have been used

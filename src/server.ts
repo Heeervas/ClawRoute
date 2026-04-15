@@ -19,10 +19,12 @@ import { createAuthMiddleware } from './auth.js';
 import { classifyRequest, explainClassification } from './classifier.js';
 import { routeRequest } from './router.js';
 import { executeRequest, executePassthrough } from './executor.js';
+import { getEnabledModels, getModelEntryStrict } from './models.js';
 import { logRouting } from './logger.js';
 import { getStatsResponse } from './stats.js';
 import { getRedactedConfig } from './config.js';
 import { generateRequestId, nowIso, stripMetadataPreamble } from './utils.js';
+import { responsesBodyToChatCompletions, chatCompletionToResponsesBody } from './responses-adapter.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -349,6 +351,64 @@ export function createApp(config: ClawRouteConfig): Hono {
         }
     });
 
+    // OpenAI Responses API endpoint
+    app.post('/v1/responses', async (c) => {
+        const requestId = generateRequestId();
+
+        try {
+            const body = await c.req.json();
+
+            if (!body.model) {
+                return c.json(
+                    { error: { message: 'model is required', type: 'invalid_request_error' } },
+                    400
+                );
+            }
+            if (!body.input || !Array.isArray(body.input)) {
+                return c.json(
+                    { error: { message: 'input is required and must be an array', type: 'invalid_request_error' } },
+                    400
+                );
+            }
+
+            // Translate Responses API → Chat Completions
+            const ccRequest = responsesBodyToChatCompletions(body);
+
+            if (config.logging.debugMode) {
+                console.log(`[${requestId}] /v1/responses → CC for model: ${ccRequest.model}`);
+            }
+
+            // If ClawRoute is disabled, passthrough
+            if (!config.enabled) {
+                const response = await executePassthrough(ccRequest, config);
+                const ccJson = await response.json() as Record<string, unknown>;
+                return c.json(chatCompletionToResponsesBody(ccJson));
+            }
+
+            // Classify → Route → Execute
+            const classification = classifyRequest(ccRequest, config);
+            const routing = routeRequest(ccRequest, classification, config);
+            const result = await executeRequest(ccRequest, routing, classification, config);
+
+            // Translate CC response back to Responses API format
+            const ccJson = await result.response.json() as Record<string, unknown>;
+            const responsesBody = chatCompletionToResponsesBody(ccJson);
+            return c.json(responsesBody);
+        } catch (error) {
+            console.error(`[${requestId}] Error in /v1/responses:`, error);
+            return c.json(
+                {
+                    error: {
+                        message: 'Failed to process request',
+                        type: 'server_error',
+                        code: 'internal_error',
+                    },
+                },
+                500
+            );
+        }
+    });
+
     // Anthropic-compatible endpoint placeholder
     app.post('/v1/messages', async (c) => {
         // For now, return a helpful error
@@ -368,6 +428,86 @@ export function createApp(config: ClawRouteConfig): Hono {
 
     // Legacy license endpoints removed
 
+    // OpenAI-compatible: List models
+    app.get('/v1/models', (c) => {
+        const models = getEnabledModels();
+        return c.json({
+            object: 'list',
+            data: models.map(m => ({
+                id: m.id,
+                object: 'model',
+                created: 1700000000,
+                owned_by: m.provider,
+                // Extension fields for ClawRoute-aware clients
+                max_context: m.maxContext,
+                tool_capable: m.toolCapable,
+                multimodal: m.multimodal,
+            })),
+        });
+    });
+
+    // OpenAI-compatible: Retrieve model
+    app.get('/v1/models/:id{.+}', (c) => {
+        const modelId = c.req.param('id');
+        const entry = getModelEntryStrict(modelId);
+        if (!entry || !entry.enabled) {
+            return c.json({
+                error: {
+                    message: `The model '${modelId}' does not exist`,
+                    type: 'invalid_request_error',
+                    code: 'model_not_found',
+                },
+            }, 404);
+        }
+        return c.json({
+            id: entry.id,
+            object: 'model',
+            created: 1700000000,
+            owned_by: entry.provider,
+            max_context: entry.maxContext,
+            tool_capable: entry.toolCapable,
+            multimodal: entry.multimodal,
+        });
+    });
+
+    // ClawRoute-specific: Full model info with costs
+    app.get('/api/models', (c) => {
+        const models = getEnabledModels();
+        return c.json({
+            models: models.map(m => ({
+                id: m.id,
+                provider: m.provider,
+                maxContext: m.maxContext,
+                inputCostPer1M: m.inputCostPer1M,
+                outputCostPer1M: m.outputCostPer1M,
+                toolCapable: m.toolCapable,
+                multimodal: m.multimodal,
+                enabled: m.enabled,
+            })),
+        });
+    });
+
+    // Legacy completions API (not supported)
+    app.post('/v1/completions', (c) => {
+        return c.json({
+            error: {
+                message: 'Legacy completions API not supported. Use /v1/chat/completions instead.',
+                type: 'invalid_request_error',
+                code: 'unsupported_endpoint',
+            },
+        }, 400);
+    });
+
+    // Embeddings API (not supported)
+    app.post('/v1/embeddings', (c) => {
+        return c.json({
+            error: {
+                message: 'Embeddings API not supported by ClawRoute.',
+                type: 'invalid_request_error',
+                code: 'unsupported_endpoint',
+            },
+        }, 400);
+    });
 
     // Catch-all for unknown routes
     app.all('*', (c) => {

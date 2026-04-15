@@ -367,4 +367,115 @@ describe('Router', () => {
             expect(moderateShort.estimatedSavingsUsd).toBeGreaterThan(heartbeatShort.estimatedSavingsUsd * 5);
         });
     });
+
+    describe('Client-Specified Model Bypass', () => {
+        it('should bypass tier routing when client specifies a known model with API key', () => {
+            const config = createTestConfig();
+            const request = createRequest('anthropic/claude-sonnet-4-6');
+            const classification = createClassification(TaskTier.HEARTBEAT);
+
+            const decision = routeRequest(request, classification, config);
+
+            // Should route to the client-specified model, NOT the heartbeat tier model
+            expect(decision.routedModel).toBe('anthropic/claude-sonnet-4-6');
+            expect(decision.reason).toContain('client-specified');
+        });
+
+        it('should use tier routing when model is clawroute/auto', () => {
+            const config = createTestConfig();
+            const request = createRequest('clawroute/auto');
+            const classification = createClassification(TaskTier.SIMPLE);
+
+            const decision = routeRequest(request, classification, config);
+
+            // clawroute/auto should trigger normal tier routing
+            expect(decision.routedModel).toBe('deepseek/deepseek-chat');
+            expect(decision.reason).not.toContain('client-specified');
+        });
+
+        it('should fall through to tier routing for unknown models', () => {
+            const config = createTestConfig();
+            const request = createRequest('some-random-model/foo');
+            const classification = createClassification(TaskTier.SIMPLE);
+
+            const decision = routeRequest(request, classification, config);
+
+            // Unknown model not in registry → tier routing picks the tier model
+            expect(decision.routedModel).toBe('deepseek/deepseek-chat');
+            expect(decision.reason).not.toContain('client-specified');
+        });
+
+        it('should let global override take precedence over client-specified model', () => {
+            const config = createTestConfig();
+            config.overrides.globalForceModel = 'openai/gpt-4o';
+
+            const request = createRequest('anthropic/claude-sonnet-4-6');
+            const classification = createClassification(TaskTier.HEARTBEAT);
+
+            const decision = routeRequest(request, classification, config);
+
+            // Global override wins over client-specified model
+            expect(decision.routedModel).toBe('openai/gpt-4o');
+            expect(decision.isOverride).toBe(true);
+        });
+
+        it('should respect dry-run with client-specified model', () => {
+            const config = createTestConfig({ dryRun: true });
+            const request = createRequest('anthropic/claude-sonnet-4-6');
+            const classification = createClassification(TaskTier.HEARTBEAT);
+
+            const decision = routeRequest(request, classification, config);
+
+            // Dry-run: use original model, but reason indicates what would have been used
+            expect(decision.routedModel).toBe('anthropic/claude-sonnet-4-6');
+            expect(decision.isDryRun).toBe(true);
+            expect(decision.reason).toContain('dry-run');
+            expect(decision.reason).toContain('anthropic/claude-sonnet-4-6');
+        });
+
+        it('should fall through to tier routing when client-specified model has no API key', () => {
+            const config = createTestConfig({
+                apiKeys: {
+                    anthropic: '',       // No key for the client-specified model
+                    openai: 'test-key',
+                    google: 'test-key',
+                    deepseek: 'test-key',
+                    openrouter: '',
+                    ollama: '',
+                },
+            });
+
+            const request = createRequest('anthropic/claude-sonnet-4-6');
+            const classification = createClassification(TaskTier.SIMPLE);
+
+            const decision = routeRequest(request, classification, config);
+
+            // No API key for anthropic → fall through to tier routing
+            // SIMPLE tier primary is deepseek (has key)
+            expect(decision.routedModel).toBe('deepseek/deepseek-chat');
+        });
+
+        it('should calculate savings correctly with bypass', () => {
+            const config = createTestConfig();
+            const request = createRequest('anthropic/claude-sonnet-4-6');
+            const classification = createClassification(TaskTier.HEARTBEAT);
+
+            const decision = routeRequest(request, classification, config);
+
+            // When bypassing, savings compare client-specified model vs baseline
+            expect(decision.estimatedSavingsUsd).toBeDefined();
+            expect(typeof decision.estimatedSavingsUsd).toBe('number');
+        });
+
+        it('should indicate client-specified in the reason field', () => {
+            const config = createTestConfig();
+            const request = createRequest('anthropic/claude-sonnet-4-6');
+            const classification = createClassification(TaskTier.MODERATE);
+
+            const decision = routeRequest(request, classification, config);
+
+            expect(decision.routedModel).toBe('anthropic/claude-sonnet-4-6');
+            expect(decision.reason).toContain('client-specified');
+        });
+    });
 });

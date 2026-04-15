@@ -20,6 +20,7 @@ import {
     ProviderType,
     AlertsConfig,
 } from './types.js';
+import { applyContextOverrides } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -395,6 +396,14 @@ export function loadConfig(): ClawRouteConfig {
 
     // v1.1: Load alerts configuration from environment
     config.alerts = loadAlertsConfig();
+
+    // Apply per-model maxContext overrides from config
+    if (config.contextOverrides && Object.keys(config.contextOverrides).length > 0) {
+        applyContextOverrides(config.contextOverrides);
+        if (config.logging.debugMode) {
+            console.log(`📏 Applied ${Object.keys(config.contextOverrides).length} context overrides`);
+        }
+    }
 
     // Validate the final configuration
     validateConfig(config);
