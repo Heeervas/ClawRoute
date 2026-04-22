@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { classifyRequest } from '../src/classifier.js';
 import { getProviderForModel, getApiBaseUrl } from '../src/models.js';
 import { TaskTier, ChatCompletionRequest, ClawRouteConfig } from '../src/types.js';
+import { stripMetadataPreamble } from '../src/utils.js';
 
 // Helper to create a minimal config for testing
 function createTestConfig(): ClawRouteConfig {
@@ -355,6 +356,96 @@ describe('Classifier', () => {
             request.model = 'heartbeat-monitor';
             const result = classifyRequest(request, config);
             expect(result.tier).toBe(TaskTier.HEARTBEAT);
+        });
+    });
+
+    // ========== SPANISH LANGUAGE SUPPORT ==========
+    describe('Spanish Language Support', () => {
+        // Spanish acknowledgments should be recognized as SIMPLE
+        it.each([
+            'Gracias', 'Perfecto', 'Vale', 'Okey', 'Sí',
+            'Hecho', 'Genial', 'Dale', 'Claro', 'De acuerdo', 'Entendido',
+        ])('should classify "%s" as simple (Spanish acknowledgment)', (word) => {
+            const result = classifyRequest(createRequest(word), config);
+            expect(result.tier).toBe(TaskTier.SIMPLE);
+        });
+
+        // Spanish greetings/status checks should be HEARTBEAT via pattern, not just catch-all
+        it('should classify "Hola" as heartbeat (Spanish greeting) in deep conversation', () => {
+            const result = classifyRequest(createRequest('Hola', 5), config);
+            expect(result.tier).toBe(TaskTier.HEARTBEAT);
+        });
+
+        it('should classify "Estás ahí?" as heartbeat (Spanish status check) in deep conversation', () => {
+            const result = classifyRequest(createRequest('Estás ahí?', 5), config);
+            expect(result.tier).toBe(TaskTier.HEARTBEAT);
+        });
+    });
+
+    // ========== SHORT COMMANDS WITH TECHNICAL VERBS ==========
+    describe('Short Commands with Technical Verbs (no noun)', () => {
+        // Technical verb WITHOUT a technical noun should still be SIMPLE
+        it.each([
+            ['Fix it', 'verb only, no technical noun'],
+            ['Fix it, don\'t ask', 'verb + instruction, no noun'],
+            ['How do we fix this?', 'question under 40 chars, no technical noun'],
+            ['Deploy it', 'verb only, no noun'],
+        ])('should classify "%s" as simple (%s)', (msg) => {
+            const result = classifyRequest(createRequest(msg, 5), config);
+            expect(result.tier).toBe(TaskTier.SIMPLE);
+        });
+
+        // Technical verb + technical noun = COMPLEX (should NOT be simple)
+        it('should NOT classify "Fix the database migration" as simple (verb + noun = complex)', () => {
+            const result = classifyRequest(createRequest('Fix the database migration', 5), config);
+            expect(result.tier).not.toBe(TaskTier.SIMPLE);
+        });
+    });
+
+    // ========== SYSTEM PREAMBLE STRIPPING ==========
+    describe('System Preamble Stripping', () => {
+        it('should strip [SYSTEM: ...] block before user text', () => {
+            const input = '[SYSTEM: You are a helpful assistant.]\nWhat is 2+2?';
+            const result = stripMetadataPreamble(input);
+            expect(result).toBe('What is 2+2?');
+        });
+
+        it('should strip [CONTEXT COMPACTION] block before user text', () => {
+            const input = '[CONTEXT COMPACTION] Previous context was compressed.\nActual user question here.';
+            const result = stripMetadataPreamble(input);
+            expect(result).toBe('Actual user question here.');
+        });
+
+        it('should strip [Your active task list was preserved...] block', () => {
+            const input = '[Your active task list was preserved from the previous session.]\nDo the next task.';
+            const result = stripMetadataPreamble(input);
+            expect(result).toBe('Do the next task.');
+        });
+
+        it('should strip [Replying to: "..."] block', () => {
+            const input = '[Replying to: "How do I fix this?"]\nYes, try restarting.';
+            const result = stripMetadataPreamble(input);
+            expect(result).toBe('Yes, try restarting.');
+        });
+    });
+
+    // ========== LONG MESSAGE THRESHOLD ==========
+    describe('Long Message Threshold', () => {
+        it('should NOT classify 650-char message without keywords as complex', () => {
+            // After raising threshold to 800, 650 chars should fall to MODERATE
+            const msg = 'This is a regular message without any special keywords. '.repeat(13).trim();
+            // Ensure msg is roughly 650 chars
+            const padded = msg.substring(0, 650).padEnd(650, '.');
+            const result = classifyRequest(createRequest(padded, 5), config);
+            expect(result.tier).not.toBe(TaskTier.COMPLEX);
+        });
+
+        it('should classify 850-char message as complex via long_message signal', () => {
+            const msg = 'This is a long detailed message with many parts. '.repeat(18).trim();
+            const padded = msg.substring(0, 850).padEnd(850, '.');
+            const result = classifyRequest(createRequest(padded, 5), config);
+            expect(result.tier).toBe(TaskTier.COMPLEX);
+            expect(result.signals).toContain('long_message');
         });
     });
 });

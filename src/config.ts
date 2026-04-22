@@ -216,7 +216,10 @@ function loadCodexToken(): string {
         return process.env['OPENAI_CODEX_TOKEN'];
     }
     try {
-        const authPath = process.env['OPENAI_CODEX_AUTH_PATH'] || join(homedir(), '.codex', 'auth.json');
+        const multiPaths = process.env['OPENAI_CODEX_AUTH_PATHS'];
+        const authPath = multiPaths
+            ? multiPaths.split(',')[0]?.trim() ?? ''
+            : (process.env['OPENAI_CODEX_AUTH_PATH'] || join(homedir(), '.codex', 'auth.json'));
         if (existsSync(authPath)) {
             const content = readFileSync(authPath, 'utf-8');
             const auth = JSON.parse(content) as Record<string, unknown>;

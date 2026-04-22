@@ -2,14 +2,14 @@
     "baselineModel": "openrouter/anthropic/claude-sonnet-4.6",
     "models": {
         "heartbeat": {
-            "primary": "qwen/qwen3.6-plus-preview:free",
-            "fallback": "openrouter/stepfun/step-3.5-flash:free",
-            "tertiary": "openrouter/google/gemini-3.1-flash-lite-preview"
+            "primary": "openrouter/google/gemini-3.1-flash-lite-preview",
+            "fallback": "openrouter/minimax/minimax-m2.7",
+            "tertiary": "openrouter/z-ai/glm-5.1"
         },
         "simple": {
-            "primary": "qwen/qwen3.6-plus-preview:free",
-            "fallback": "openrouter/stepfun/step-3.5-flash:free",
-            "tertiary": "openrouter/google/gemini-3.1-flash-lite-preview"
+            "primary": "openrouter/google/gemini-3.1-flash-lite-preview",
+            "fallback": "openrouter/minimax/minimax-m2.7",
+            "tertiary": "openrouter/z-ai/glm-5.1"
         },
         "moderate": {
             "primary": "qwen/qwen3.6-plus-preview:free",

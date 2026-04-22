@@ -194,3 +194,135 @@ export function chatCompletionToResponsesBody(
         }),
     };
 }
+
+/**
+ * Convert a completed Responses API body into an SSE Response
+ * suitable for clients that called with stream: true.
+ *
+ * Emits the minimum event sequence the OpenAI Python SDK expects:
+ *   response.created → output items → response.completed
+ *
+ * Each event's data payload must include:
+ *   - `type` matching the SSE event name (SDK uses this for discriminated union)
+ *   - `sequence_number` (incrementing integer)
+ *   - `item_id` on content/text/function_call events
+ *
+ * `response.created` and `response.completed` wrap the body under a `response` key.
+ */
+export function responsesBodyToSSEResponse(
+    body: Record<string, unknown>,
+): Response {
+    const encoder = new TextEncoder();
+    const events: string[] = [];
+    let seq = 0;
+
+    // Build a Response-shaped object with required SDK fields
+    const now = Date.now() / 1000;
+    const responseBase = {
+        ...body,
+        created_at: (body.created_at as number) ?? now,
+        tools: (body.tools as unknown[]) ?? [],
+        tool_choice: (body.tool_choice as string) ?? 'auto',
+        parallel_tool_calls: (body.parallel_tool_calls as boolean) ?? true,
+    };
+
+    // 1. response.created — response with in_progress status, empty output
+    const createdResponse = { ...responseBase, status: 'in_progress', output: [] };
+    events.push(`event: response.created\ndata: ${JSON.stringify({
+        type: 'response.created', sequence_number: seq++, response: createdResponse,
+    })}\n\n`);
+
+    // 2. Per-output-item events
+    const output = (body.output || []) as Array<Record<string, unknown>>;
+    for (let oi = 0; oi < output.length; oi++) {
+        const item = output[oi]!;
+        const itemId = (item.id as string) ?? `item_${oi}`;
+
+        if (item.type === 'message') {
+            const itemWithId = { ...item, id: itemId, content: [] };
+            events.push(`event: response.output_item.added\ndata: ${JSON.stringify({
+                type: 'response.output_item.added', sequence_number: seq++,
+                output_index: oi, item: itemWithId,
+            })}\n\n`);
+
+            const content = (item.content || []) as Array<Record<string, unknown>>;
+            for (let ci = 0; ci < content.length; ci++) {
+                const part = content[ci]!;
+                if (part.type === 'output_text') {
+                    events.push(`event: response.content_part.added\ndata: ${JSON.stringify({
+                        type: 'response.content_part.added', sequence_number: seq++,
+                        output_index: oi, content_index: ci, item_id: itemId,
+                        part: { type: 'output_text', text: '', annotations: [] },
+                    })}\n\n`);
+                    events.push(`event: response.output_text.delta\ndata: ${JSON.stringify({
+                        type: 'response.output_text.delta', sequence_number: seq++,
+                        output_index: oi, content_index: ci, item_id: itemId,
+                        delta: part.text,
+                    })}\n\n`);
+                    events.push(`event: response.output_text.done\ndata: ${JSON.stringify({
+                        type: 'response.output_text.done', sequence_number: seq++,
+                        output_index: oi, content_index: ci, item_id: itemId,
+                        text: part.text,
+                    })}\n\n`);
+                    events.push(`event: response.content_part.done\ndata: ${JSON.stringify({
+                        type: 'response.content_part.done', sequence_number: seq++,
+                        output_index: oi, content_index: ci, item_id: itemId,
+                        part: { ...part, annotations: [] },
+                    })}\n\n`);
+                }
+            }
+
+            const doneItem = { ...item, id: itemId };
+            events.push(`event: response.output_item.done\ndata: ${JSON.stringify({
+                type: 'response.output_item.done', sequence_number: seq++,
+                output_index: oi, item: doneItem,
+            })}\n\n`);
+        } else if (item.type === 'function_call') {
+            const itemWithId = { ...item, id: itemId, arguments: '' };
+            events.push(`event: response.output_item.added\ndata: ${JSON.stringify({
+                type: 'response.output_item.added', sequence_number: seq++,
+                output_index: oi, item: itemWithId,
+            })}\n\n`);
+            events.push(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({
+                type: 'response.function_call_arguments.delta', sequence_number: seq++,
+                output_index: oi, item_id: itemId,
+                delta: item.arguments,
+            })}\n\n`);
+            events.push(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({
+                type: 'response.function_call_arguments.done', sequence_number: seq++,
+                output_index: oi, item_id: itemId,
+                name: item.name,
+                arguments: item.arguments,
+            })}\n\n`);
+            const doneItem = { ...item, id: itemId };
+            events.push(`event: response.output_item.done\ndata: ${JSON.stringify({
+                type: 'response.output_item.done', sequence_number: seq++,
+                output_index: oi, item: doneItem,
+            })}\n\n`);
+        }
+    }
+
+    // 3. response.completed — full response with completed status
+    const completedResponse = { ...responseBase, status: 'completed' };
+    events.push(`event: response.completed\ndata: ${JSON.stringify({
+        type: 'response.completed', sequence_number: seq++, response: completedResponse,
+    })}\n\n`);
+
+    const stream = new ReadableStream({
+        start(controller) {
+            for (const ev of events) {
+                controller.enqueue(encoder.encode(ev));
+            }
+            controller.close();
+        },
+    });
+
+    return new Response(stream, {
+        status: 200,
+        headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+        },
+    });
+}

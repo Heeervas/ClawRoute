@@ -39,6 +39,40 @@ interface ChatMessage {
     tool_call_id?: string;
 }
 
+interface CodexAuthSlot {
+    path: string;
+    auth: CodexAuth | null;
+    lastLoadAttempt: number;
+    rateLimitedUntil: number; // epoch ms — skip this slot until then
+}
+
+// ── Rotation State ─────────────────────────────────────────────────
+let authSlots: CodexAuthSlot[] = [];
+let currentSlotIndex = 0;
+let lastRotationTime = 0;
+let lastQueryEndTime = 0;
+let activeRequests = 0;
+
+// Configurable via env vars (read once on first use)
+let rotationIntervalMs = -1;  // -1 = not yet loaded
+let rotationIdleMs = -1;
+
+function getRotationIntervalMs(): number {
+    if (rotationIntervalMs < 0) {
+        const hours = parseFloat(process.env['CODEX_ROTATION_INTERVAL_HOURS'] ?? '2');
+        rotationIntervalMs = (isNaN(hours) ? 2 : hours) * 3_600_000;
+    }
+    return rotationIntervalMs;
+}
+
+function getRotationIdleMs(): number {
+    if (rotationIdleMs < 0) {
+        const minutes = parseFloat(process.env['CODEX_ROTATION_IDLE_MINUTES'] ?? '30');
+        rotationIdleMs = (isNaN(minutes) ? 30 : minutes) * 60_000;
+    }
+    return rotationIdleMs;
+}
+
 // ── Constants ──────────────────────────────────────────────────────
 
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
@@ -90,15 +124,24 @@ function isTokenExpired(accessToken: string): boolean {
 }
 
 /**
- * Resolve the auth file path.
+ * Resolve auth file paths (supports multi-key rotation).
  */
-function resolveAuthPath(): string {
+export function resolveAuthPaths(): string[] {
+    const multiPaths = process.env['OPENAI_CODEX_AUTH_PATHS'];
+    if (multiPaths && multiPaths.trim()) {
+        return multiPaths.split(',').map(p => p.trim()).filter(Boolean);
+    }
     if (process.env['OPENAI_CODEX_AUTH_PATH']) {
-        return process.env['OPENAI_CODEX_AUTH_PATH'];
+        return [process.env['OPENAI_CODEX_AUTH_PATH']];
+    }
+    if (process.env['OPENAI_CODEX_TOKEN']) {
+        return []; // Token mode, no file-based rotation
     }
     const codexHome = process.env['CODEX_HOME'];
-    if (codexHome) return join(codexHome, 'auth.json');
-    return join(homedir(), '.codex', 'auth.json');
+    const defaultPath = codexHome
+        ? join(codexHome, 'auth.json')
+        : join(homedir(), '.codex', 'auth.json');
+    return [defaultPath];
 }
 
 /**
@@ -183,21 +226,12 @@ function writeAuthFile(
     }
 }
 
-// Cached auth to avoid re-reading the file on every request
-let cachedAuth: CodexAuth | null = null;
-
 /**
- * Load and optionally refresh the Codex OAuth credentials.
+ * Load auth from a specific file path (read, check expiry, refresh if needed).
  * Returns null if no valid credentials are found.
  */
-export async function loadCodexAuth(proxyAgent: ProxyAgent | null): Promise<CodexAuth | null> {
-    // Fast path: use cached auth if token is still valid
-    if (cachedAuth && !isTokenExpired(cachedAuth.accessToken)) {
-        return cachedAuth;
-    }
-
-    const authPath = resolveAuthPath();
-    const authData = readAuthFile(authPath);
+async function loadAuthFromFile(path: string, proxyAgent: ProxyAgent | null): Promise<CodexAuth | null> {
+    const authData = readAuthFile(path);
     if (!authData) return null;
 
     const tokens = authData['tokens'] as Record<string, unknown> | undefined;
@@ -210,7 +244,7 @@ export async function loadCodexAuth(proxyAgent: ProxyAgent | null): Promise<Code
 
     // Refresh if expired or about to expire
     if (isTokenExpired(accessToken) && refreshToken) {
-        console.log('[codex-transport] Access token expired, refreshing...');
+        console.log(`[codex-transport] Access token expired for ${path}, refreshing...`);
         const refreshed = await refreshTokens(refreshToken, proxyAgent);
         if (refreshed) {
             accessToken = refreshed.accessToken;
@@ -218,7 +252,7 @@ export async function loadCodexAuth(proxyAgent: ProxyAgent | null): Promise<Code
             refreshToken = refreshed.refreshToken;
             accountId = refreshed.accountId ?? accountId;
 
-            writeAuthFile(authPath, authData, {
+            writeAuthFile(path, authData, {
                 access_token: accessToken,
                 id_token: idToken,
                 refresh_token: refreshToken,
@@ -231,12 +265,175 @@ export async function loadCodexAuth(proxyAgent: ProxyAgent | null): Promise<Code
     }
 
     if (!accountId) {
-        console.warn('[codex-transport] No account_id found — Codex requests may fail');
+        console.warn(`[codex-transport] No account_id found in ${path} — skipping`);
         return null;
     }
 
-    cachedAuth = { accessToken, accountId, refreshToken, idToken, sourcePath: authPath };
-    return cachedAuth;
+    return { accessToken, accountId, refreshToken, idToken, sourcePath: path };
+}
+
+// ── Rotation Helpers ───────────────────────────────────────────────
+
+export function resetRotationState(): void {
+    authSlots = [];
+    currentSlotIndex = 0;
+    lastRotationTime = 0;
+    lastQueryEndTime = 0;
+    activeRequests = 0;
+    rotationIntervalMs = -1;
+    rotationIdleMs = -1;
+}
+
+export function getRotationState(): {
+    currentSlotIndex: number;
+    activeRequests: number;
+    lastRotationTime: number;
+    lastQueryEndTime: number;
+    slotCount: number;
+} {
+    return {
+        currentSlotIndex,
+        activeRequests,
+        lastRotationTime,
+        lastQueryEndTime,
+        slotCount: authSlots.length,
+    };
+}
+
+export function initializeSlots(paths: string[]): void {
+    authSlots = paths.map(path => ({
+        path,
+        auth: null,
+        lastLoadAttempt: 0,
+        rateLimitedUntil: 0,
+    }));
+    const now = Date.now();
+    if (lastRotationTime === 0) lastRotationTime = now;
+    if (lastQueryEndTime === 0) lastQueryEndTime = now;
+    console.log(`[codex-rotation] Initialized ${authSlots.length} auth slot(s)`);
+}
+
+export function shouldRotate(): boolean {
+    if (authSlots.length <= 1) return false;
+    if (activeRequests > 0) return false;
+    const now = Date.now();
+    return (now - lastRotationTime) >= getRotationIntervalMs()
+        && (now - lastQueryEndTime) >= getRotationIdleMs();
+}
+
+export function performRotation(): void {
+    const oldIndex = currentSlotIndex;
+    currentSlotIndex = (currentSlotIndex + 1) % authSlots.length;
+    const now = Date.now();
+    const idleMinutes = Math.round((now - lastQueryEndTime) / 60_000);
+    const sinceRotation = formatDuration(now - lastRotationTime);
+    lastRotationTime = now;
+    const newSlot = authSlots[currentSlotIndex];
+    if (newSlot) newSlot.auth = null;
+    console.log(
+        `[codex-rotation] Rotated from slot ${oldIndex} to slot ${currentSlotIndex}`
+        + ` (idle: ${idleMinutes}m, since rotation: ${sinceRotation})`,
+    );
+}
+
+function formatDuration(ms: number): string {
+    const hours = Math.floor(ms / 3_600_000);
+    const minutes = Math.round((ms % 3_600_000) / 60_000);
+    return hours > 0 ? `${hours}h${minutes}m` : `${minutes}m`;
+}
+
+export function releaseCodexAuth(): void {
+    if (activeRequests > 0) activeRequests--;
+    lastQueryEndTime = Date.now();
+}
+
+/**
+ * Advance to the next slot without imposing a rate-limit cooldown.
+ * Used after transient errors (e.g. 500) so the next attempt tries a different account.
+ */
+function advanceSlot(): void {
+    if (authSlots.length <= 1) return;
+    const oldIndex = currentSlotIndex;
+    currentSlotIndex = (currentSlotIndex + 1) % authSlots.length;
+    console.log(`[codex-rotation] Advanced from slot ${oldIndex} to slot ${currentSlotIndex} (transient error)`);
+}
+
+type AuthResult =
+    | { ok: true; auth: CodexAuth }
+    | { ok: false; reason: 'all_rate_limited' | 'auth_missing' };
+
+/**
+ * Get the active Codex auth, handling slot rotation and fallback.
+ * Increments activeRequests on success — caller MUST call releaseCodexAuth() when done.
+ */
+export async function getActiveCodexAuth(
+    proxyAgent: ProxyAgent | null,
+    excludedSlotIndexes = new Set<number>(),
+): Promise<AuthResult> {
+    // Fast path: explicit token (no rotation)
+    if (process.env['OPENAI_CODEX_TOKEN']) {
+        activeRequests++;
+        return {
+            ok: true,
+            auth: {
+                accessToken: process.env['OPENAI_CODEX_TOKEN'],
+                accountId: '', // Token mode — account ID derived at request time
+            },
+        };
+    }
+
+    // Initialize slots on first call
+    if (authSlots.length === 0) {
+        initializeSlots(resolveAuthPaths());
+    }
+    if (authSlots.length === 0) return { ok: false, reason: 'auth_missing' };
+
+    // Check rotation BEFORE starting the request
+    if (shouldRotate()) performRotation();
+
+    // Increment BEFORE async work (prevents race conditions)
+    activeRequests++;
+
+    // Try current slot, then rotate through others on failure
+    const now = Date.now();
+    let sawRateLimitedSlot = false;
+    for (let attempt = 0; attempt < authSlots.length; attempt++) {
+        const slotIndex = (currentSlotIndex + attempt) % authSlots.length;
+        if (excludedSlotIndexes.has(slotIndex)) continue;
+        const slot = authSlots[slotIndex]!;
+
+        // Skip slots that are currently rate-limited
+        if (slot.rateLimitedUntil > now) {
+            sawRateLimitedSlot = true;
+            const remainMin = Math.ceil((slot.rateLimitedUntil - now) / 60_000);
+            console.log(`[codex-rotation] Slot ${slotIndex} rate-limited for ${remainMin}m, skipping`);
+            continue;
+        }
+
+        // Use cached slot auth if token still valid
+        if (slot.auth && !isTokenExpired(slot.auth.accessToken)) {
+            if (attempt > 0) {
+                currentSlotIndex = slotIndex;
+                console.log(`[codex-rotation] Slot ${slotIndex} selected after ${attempt} skip(s)`);
+            }
+            return { ok: true, auth: slot.auth };
+        }
+
+        // Load from file
+        const auth = await loadAuthFromFile(slot.path, proxyAgent);
+        if (auth) {
+            slot.auth = auth;
+            slot.lastLoadAttempt = Date.now();
+            if (attempt > 0) currentSlotIndex = slotIndex;
+            return { ok: true, auth };
+        }
+
+        console.warn(`[codex-rotation] Slot ${slotIndex} (${slot.path}): auth load failed, trying next`);
+    }
+
+    // All slots failed
+    activeRequests--;
+    return { ok: false, reason: sawRateLimitedSlot ? 'all_rate_limited' : 'auth_missing' };
 }
 
 // ── Request Translation ────────────────────────────────────────────
@@ -347,7 +544,7 @@ export function buildCodexRequestBody(
     };
 
     // Forward compatible parameters
-    if (request['temperature'] !== undefined) body['temperature'] = request['temperature'];
+    // Note: temperature is intentionally omitted — Codex endpoint rejects it as unsupported.
     if (request['top_p'] !== undefined) body['top_p'] = request['top_p'];
     if (request['tools']) {
         // Translate Chat Completions tool format → Responses API format.
@@ -693,50 +890,116 @@ export function codexResponseToStream(
 // ── Main Request Handler ───────────────────────────────────────────
 
 /**
- * Execute a request through the Codex ChatGPT subscription endpoint.
- *
- * This replaces the normal makeProviderRequest flow for codex/ models.
- * Returns a Response that looks like a standard OpenAI Chat Completions
- * response (either streaming SSE or JSON), so the rest of ClawRoute's
- * executor pipeline (pipeStream, usage tracking) works unchanged.
+ * Parse the structured Codex error payload when the upstream body is JSON.
  */
-export async function makeCodexRequest(
-    request: Record<string, unknown>,
-    modelId: string,
-    proxyAgent: ProxyAgent | null,
-): Promise<Response> {
-    // 1. Load auth
-    const auth = await loadCodexAuth(proxyAgent);
-    if (!auth) {
-        return new Response(
-            JSON.stringify({
-                error: {
-                    message: 'Codex OAuth credentials not found. Run `codex login` or set OPENAI_CODEX_AUTH_PATH.',
-                    type: 'auth_error',
-                    code: 'codex_auth_missing',
-                },
-            }),
-            { status: 401, headers: { 'Content-Type': 'application/json' } },
-        );
+function parseCodexError(errorBody: string): Record<string, unknown> | null {
+    try {
+        const parsed = JSON.parse(errorBody);
+        if (typeof parsed !== 'object' || parsed === null) return null;
+        const nestedError = (parsed as Record<string, unknown>)['error'] ?? parsed;
+        return typeof nestedError === 'object' && nestedError !== null
+            ? nestedError as Record<string, unknown>
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Normalize upstream Codex errors into the existing ClawRoute envelope.
+ */
+function buildCodexErrorBody(status: number, errorBody: string): string {
+    const parsedError = parseCodexError(errorBody);
+    const upstreamMessage = typeof parsedError?.['message'] === 'string'
+        ? parsedError['message']
+        : errorBody.trim();
+    const message = upstreamMessage
+        ? `Codex API error (${status}): ${upstreamMessage}`
+        : `Codex API error (${status})`;
+    const error: Record<string, unknown> = {
+        message,
+        type: 'upstream_error',
+        code: `codex_${status}`,
+    };
+    if (typeof parsedError?.['type'] === 'string') {
+        error['upstream_type'] = parsedError['type'];
+    }
+    if (typeof parsedError?.['resets_at'] === 'number') {
+        error['resets_at'] = parsedError['resets_at'];
+    }
+    if (typeof parsedError?.['resets_in_seconds'] === 'number') {
+        error['resets_in_seconds'] = parsedError['resets_in_seconds'];
+    }
+    return JSON.stringify({ error });
+}
+
+/**
+ * Mark the current slot as rate-limited and extract resets_at from error body.
+ */
+function markSlotRateLimited(slotIndex: number, errorBody: string): void {
+    const slot = authSlots[slotIndex];
+    if (!slot) return;
+
+    // Try to extract resets_at from the Codex error JSON
+    let resetsAt = 0;
+    const parsedError = parseCodexError(errorBody);
+    if (typeof parsedError?.['resets_at'] === 'number') {
+        resetsAt = parsedError['resets_at'] * 1000; // seconds → ms
+    } else if (typeof parsedError?.['resets_in_seconds'] === 'number') {
+        resetsAt = Date.now() + parsedError['resets_in_seconds'] * 1000;
     }
 
-    // 2. Extract model name (strip codex/ prefix)
-    const modelName = modelId.includes('/') ? modelId.split('/').slice(1).join('/') : modelId;
+    // Fallback: 15 minute cooldown if no resets_at found
+    slot.rateLimitedUntil = resetsAt > 0 ? resetsAt : Date.now() + 15 * 60_000;
+    const cooldownMin = Math.ceil((slot.rateLimitedUntil - Date.now()) / 60_000);
+    console.log(
+        `[codex-rotation] Slot ${slotIndex} (${slot.path}) marked rate-limited for ${cooldownMin}m`,
+    );
+}
 
-    // 3. Build the Responses API request body
-    const body = buildCodexRequestBody(request, modelName);
-    const wantsStream = request['stream'] === true;
+function getCodexUpstreamType(errorBody: string): string | null {
+    const parsedError = parseCodexError(errorBody);
+    if (typeof parsedError?.['upstream_type'] === 'string') return parsedError['upstream_type'];
+    return typeof parsedError?.['type'] === 'string' ? parsedError['type'] : null;
+}
 
-    // 4. Call the Codex endpoint
+function shouldRetryCodexError(status: number, errorBody: string): boolean {
+    if (status === 500) return true;
+    return status === 429 && getCodexUpstreamType(errorBody) === 'usage_limit_reached';
+}
+
+function getEarliestRateLimitInfo(): { resetsAt: number; resetsInSeconds: number } | null {
+    const now = Date.now();
+    const futureResets = authSlots.map(slot => slot.rateLimitedUntil).filter(resetAt => resetAt > now);
+    if (futureResets.length === 0) return null;
+    const earliestReset = Math.min(...futureResets);
+    return {
+        resetsAt: Math.ceil(earliestReset / 1000),
+        resetsInSeconds: Math.ceil((earliestReset - now) / 1000),
+    };
+}
+
+/**
+ * Execute a single Codex request with the given auth.
+ * Returns the Response (success or error).
+ */
+async function executeCodexCall(
+    auth: CodexAuth,
+    body: Record<string, unknown>,
+    modelName: string,
+    wantsStream: boolean,
+    proxyAgent: ProxyAgent | null,
+): Promise<Response> {
     const url = `${CODEX_BASE_URL}/responses`;
+    const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${auth.accessToken}`,
+        'OpenAI-Beta': 'responses=experimental',
+    };
+    if (auth.accountId) headers['chatgpt-account-id'] = auth.accountId;
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${auth.accessToken}`,
-            'chatgpt-account-id': auth.accountId,
-            'OpenAI-Beta': 'responses=experimental',
-        },
+        headers,
         body: JSON.stringify(body),
     };
     if (proxyAgent) fetchOptions.dispatcher = proxyAgent;
@@ -750,16 +1013,9 @@ export async function makeCodexRequest(
         clearTimeout(timeoutId);
 
         if (!upstream.ok) {
-            // Pass through error response
             const errorBody = await upstream.text();
             return new Response(
-                JSON.stringify({
-                    error: {
-                        message: `Codex API error (${upstream.status}): ${errorBody}`,
-                        type: 'upstream_error',
-                        code: `codex_${upstream.status}`,
-                    },
-                }),
+                buildCodexErrorBody(upstream.status, errorBody),
                 { status: upstream.status, headers: { 'Content-Type': 'application/json' } },
             );
         }
@@ -771,7 +1027,6 @@ export async function makeCodexRequest(
             );
         }
 
-        // 5. Transform the Responses API SSE stream to Chat Completions format
         const transformedBody = codexResponseToStream(upstream.body, modelName, wantsStream);
 
         if (wantsStream) {
@@ -784,8 +1039,6 @@ export async function makeCodexRequest(
                 },
             });
         } else {
-            // For non-streaming: the transform collects everything and emits JSON
-            // Read the full body and return as application/json
             const reader = transformedBody.getReader();
             const chunks: Uint8Array[] = [];
             while (true) {
@@ -812,4 +1065,130 @@ export async function makeCodexRequest(
             { status: 502, headers: { 'Content-Type': 'application/json' } },
         );
     }
+}
+
+/**
+ * Execute a request through the Codex ChatGPT subscription endpoint.
+ *
+ * This replaces the normal makeProviderRequest flow for codex/ models.
+ * Returns a Response that looks like a standard OpenAI Chat Completions
+ * response (either streaming SSE or JSON), so the rest of ClawRoute's
+ * executor pipeline (pipeStream, usage tracking) works unchanged.
+ *
+ * On 429 (usage_limit_reached), rotates to the next auth slot and retries
+ * before returning the error to the caller.
+ */
+export async function makeCodexRequest(
+    request: Record<string, unknown>,
+    modelId: string,
+    proxyAgent: ProxyAgent | null,
+): Promise<Response> {
+    // 1. Extract model name (strip codex/ prefix)
+    const modelName = modelId.includes('/') ? modelId.split('/').slice(1).join('/') : modelId;
+
+    // 2. Build the Responses API request body
+    const body = buildCodexRequestBody(request, modelName);
+    const wantsStream = request['stream'] === true;
+
+    // 3. Try each available slot (current first, then rotate on 429)
+    let lastErrorResponse: Response | null = null;
+    const triedSlotIndexes = new Set<number>();
+    const configuredSlotCount = process.env['OPENAI_CODEX_TOKEN']
+        ? 1
+        : (authSlots.length > 0 ? authSlots.length : resolveAuthPaths().length);
+    const slotCount = Math.max(configuredSlotCount, 1); // at least 1 attempt
+
+    for (let attempt = 0; attempt < slotCount; attempt++) {
+        const result = await getActiveCodexAuth(proxyAgent, triedSlotIndexes);
+        if (!result.ok) {
+            if (result.reason === 'all_rate_limited') {
+                const resetInfo = getEarliestRateLimitInfo();
+                return lastErrorResponse ?? new Response(
+                    JSON.stringify({
+                        error: {
+                            message: 'All Codex auth slots are currently rate-limited. Try again later.',
+                            type: 'upstream_error',
+                            code: 'codex_429',
+                            ...(resetInfo ? {
+                                resets_at: resetInfo.resetsAt,
+                                resets_in_seconds: resetInfo.resetsInSeconds,
+                            } : {}),
+                        },
+                    }),
+                    { status: 429, headers: { 'Content-Type': 'application/json' } },
+                );
+            }
+            return lastErrorResponse ?? new Response(
+                JSON.stringify({
+                    error: {
+                        message: 'Codex OAuth credentials not found. Run `codex login` or set OPENAI_CODEX_AUTH_PATH.',
+                        type: 'auth_error',
+                        code: 'codex_auth_missing',
+                    },
+                }),
+                { status: 401, headers: { 'Content-Type': 'application/json' } },
+            );
+        }
+
+        const slotUsed = currentSlotIndex;
+        const response = await executeCodexCall(result.auth, body, modelName, wantsStream, proxyAgent);
+        releaseCodexAuth();
+
+        // Success or non-retriable error → return immediately
+        if (response.status !== 429 && response.status !== 500) {
+            return response;
+        }
+
+        // 429 or 500 → rotate to next slot and retry
+        const errBody = await response.text();
+        if (!shouldRetryCodexError(response.status, errBody)) {
+            return new Response(
+                errBody,
+                {
+                    status: response.status,
+                    headers: {
+                        'Content-Type': response.headers.get('Content-Type') ?? 'application/json',
+                    },
+                },
+            );
+        }
+        triedSlotIndexes.add(slotUsed);
+        if (response.status === 429) {
+            console.warn(
+                `[codex-rotation] Slot ${slotUsed} returned 429, rotating...`
+                + (attempt + 1 < slotCount ? ` (attempt ${attempt + 1}/${slotCount})` : ' (no more slots)'),
+            );
+            markSlotRateLimited(slotUsed, errBody);
+        } else {
+            // 500 — server error, may be account-specific; try next slot without rate-limit penalty
+            console.warn(
+                `[codex-rotation] Slot ${slotUsed} returned 500, trying next slot...`
+                + (attempt + 1 < slotCount ? ` (attempt ${attempt + 1}/${slotCount})` : ' (no more slots)'),
+            );
+            advanceSlot();
+        }
+
+        // Preserve last error response to return if all slots exhausted
+        lastErrorResponse = new Response(
+            errBody,
+            {
+                status: response.status,
+                headers: {
+                    'Content-Type': response.headers.get('Content-Type') ?? 'application/json',
+                },
+            },
+        );
+    }
+
+    // All slots exhausted
+    return lastErrorResponse ?? new Response(
+        JSON.stringify({
+            error: {
+                message: 'All Codex auth slots failed (rate-limited or server error)',
+                type: 'upstream_error',
+                code: 'codex_all_failed',
+            },
+        }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } },
+    );
 }

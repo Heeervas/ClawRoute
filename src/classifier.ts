@@ -53,6 +53,7 @@ const HEARTBEAT_PATTERNS = [
     /^(ping|status|alive|check|heartbeat|hey|hi|hello|test|yo)\s*[?!.]*$/i,
     /^are you (there|up|alive|ok|ready)\s*[?!.]*$/i,
     /^(can you hear me|you there|testing)\s*[?!.]*$/i,
+    /^(hola|buenas|qué tal|estás ahí)\s*[?!.]*$/i,
 ];
 
 /**
@@ -67,6 +68,7 @@ const ACKNOWLEDGMENT_PATTERNS = [
     /^(done|continue|go ahead|proceed|next|skip)\s*[!.,]*$/i,
     /^(no worries|np|no problem|don'?t worry)\s*[!.,]*$/i,
     /^[👍🙏😊👌✅❤️🎉👏]+$/,
+    /^(gracias|muchas gracias|genial|perfecto|vale|okey|listo|hecho|claro|venga|dale|adelante|correcto|de acuerdo|entendido|bueno|bien|s[ií])\s*[!.,]*$/i,
 ];
 
 /**
@@ -128,8 +130,8 @@ function isComplex(
     }
 
     // Long detailed message — multi-part question or detailed instructions
-    // Threshold 600 chars ≈ 3–4 sentences. Short follow-ups won't trigger this.
-    if (lastMessage.length > 600) {
+    // Threshold 800 chars ≈ 5–6 sentences. Raised from 600 to reduce false positives with verbose languages.
+    if (lastMessage.length > 800) {
         signals.push('long_message');
         return { match: true, confidence: 0.75, signals };
     }
@@ -151,8 +153,12 @@ function isHeartbeat(
         }
     }
     // Very short + fresh conversation + no tools
+    // — but skip if it matches an acknowledgment pattern (let SIMPLE handle those)
     if (lastMessage.length < 25 && messageCount <= 2 && !hasTools) {
-        return { match: true, confidence: 0.8 };
+        const isAcknowledgment = ACKNOWLEDGMENT_PATTERNS.some(p => p.test(lastMessage.trim()));
+        if (!isAcknowledgment) {
+            return { match: true, confidence: 0.8 };
+        }
     }
     return { match: false, confidence: 0 };
 }
@@ -176,7 +182,7 @@ function isSimple(
     // Short message (≤ 40 chars) that isn't a complex/technical request
     // — safety net for very short one-liners that aren't in acknowledgment patterns.
     // Kept tight so genuine factual questions (47+ chars) fall through to MODERATE.
-    if (trimmed.length <= 40 && !COMPLEX_KEYWORDS.test(trimmed) && !TECHNICAL_VERB.test(trimmed)) {
+    if (trimmed.length <= 40 && !COMPLEX_KEYWORDS.test(trimmed) && !(TECHNICAL_VERB.test(trimmed) && TECHNICAL_NOUN.test(trimmed))) {
         return { match: true, confidence: 0.8 };
     }
 

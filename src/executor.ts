@@ -348,6 +348,15 @@ export async function executeRequest(
                     const validation = validateResponse(response, responseBody, request, currentTier);
                     hadToolCalls = validation.hadToolCalls;
 
+                    // Always preserve the body text since we consumed `response.text()`.
+                    // Without this, the Response body is locked/disturbed and can't be read again.
+                    finalBodyText = bodyText;
+                    response = new Response(bodyText, {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: response.headers,
+                    });
+
                     if (!validation.valid) {
                         // Response is invalid - can we retry?
                         // CRITICAL: Don't retry if there were tool calls
@@ -375,14 +384,6 @@ export async function executeRequest(
                         }
                     }
 
-                    // Valid response or can't retry
-                    // Recreate response from body text (since we consumed it)
-                    finalBodyText = bodyText;
-                    response = new Response(bodyText, {
-                        status: response.status,
-                        statusText: response.statusText,
-                        headers: response.headers,
-                    });
                     break;
                 } else {
                     // HTTP error

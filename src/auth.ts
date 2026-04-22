@@ -14,8 +14,13 @@ import { ClawRouteConfig } from './types.js';
  * @param config - The ClawRoute configuration
  * @returns Hono middleware function
  */
-export function createAuthMiddleware(config: ClawRouteConfig) {
+export function createAuthMiddleware(config: ClawRouteConfig, exemptPaths?: string[]) {
     return async (c: Context, next: Next) => {
+        // Skip auth for exempt paths (e.g. /v1/models)
+        if (exemptPaths?.some(p => c.req.path === p || c.req.path.startsWith(p + '/'))) {
+            return next();
+        }
+
         // If no auth token configured, accept all requests
         if (!config.authToken) {
             return next();

@@ -73,9 +73,21 @@ export function estimateMessagesTokens(messages: ChatMessage[]): number {
 export function stripMetadataPreamble(text: string): string {
     // Matches a single "<label> (untrusted metadata):" block with a fenced code block.
     const METADATA_BLOCK = /^[^\n]+ \(untrusted metadata\):\n```[^\n]*\n[\s\S]*?\n```\n?\n?/;
+    // System-injected bracket blocks: [SYSTEM: ...], [CONTEXT COMPACTION]..., [Replying to: "..."], [Your active task list...]
+    const SYSTEM_BRACKET = /^\[SYSTEM:[\s\S]*?\]\n*/;
+    const CONTEXT_COMPACTION = /^\[CONTEXT COMPACTION\][^\n]*\n*/;
+    const TASK_LIST_PRESERVED = /^\[Your active task list was preserved[^\]]*\]\n*/;
+    const REPLYING_TO = /^\[Replying to:[^\]]*\]\n*/;
     let result = text;
-    while (METADATA_BLOCK.test(result)) {
-        result = result.replace(METADATA_BLOCK, '');
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const pattern of [METADATA_BLOCK, SYSTEM_BRACKET, CONTEXT_COMPACTION, TASK_LIST_PRESERVED, REPLYING_TO]) {
+            if (pattern.test(result)) {
+                result = result.replace(pattern, '');
+                changed = true;
+            }
+        }
     }
     return result.trim();
 }
