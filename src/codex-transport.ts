@@ -450,6 +450,21 @@ function textContent(content: unknown): string {
         .join('');
 }
 
+function assistantReasoningContent(message: ChatMessage): string | undefined {
+    const rawMessage = message as ChatMessage & Record<string, unknown>;
+    const reasoningContent = rawMessage['reasoning_content'];
+    if (typeof reasoningContent === 'string' && reasoningContent.length > 0) {
+        return reasoningContent;
+    }
+
+    const reasoning = rawMessage['reasoning'];
+    if (typeof reasoning === 'string' && reasoning.length > 0) {
+        return reasoning;
+    }
+
+    return undefined;
+}
+
 /**
  * Convert OpenAI Chat Completions messages to Responses API input items.
  *
@@ -489,13 +504,29 @@ function chatMessagesToResponsesInput(messages: ChatMessage[]): unknown[] {
             }
 
             case 'assistant': {
+                const rawMessage = msg as ChatMessage & Record<string, unknown>;
+                const reasoningContent = assistantReasoningContent(msg);
+                if (reasoningContent) {
+                    input.push({
+                        type: 'reasoning',
+                        id: typeof rawMessage['reasoning_item_id'] === 'string' && rawMessage['reasoning_item_id'].length > 0
+                            ? rawMessage['reasoning_item_id']
+                            : `rs_replay_${input.length}`,
+                        summary: [{ type: 'summary_text', text: reasoningContent }],
+                    });
+                }
+
                 const text = textContent(msg.content);
                 if (text) {
-                    input.push({
+                    const assistantItem: Record<string, unknown> = {
                         type: 'message',
                         role: 'assistant',
                         content: [{ type: 'output_text', text }],
-                    });
+                    };
+                    if (typeof rawMessage['phase'] === 'string' && rawMessage['phase'].length > 0) {
+                        assistantItem['phase'] = rawMessage['phase'];
+                    }
+                    input.push(assistantItem);
                 }
                 // Tool calls become separate function_call items
                 if (msg.tool_calls) {
@@ -685,8 +716,293 @@ export function codexResponseToStream(
     }> = [];
     let collectedUsage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } = {};
     let finishReason = 'stop';
+    const itemsWithTextDelta = new Set<string>();
+    const itemsWithDoneText = new Set<string>();
+    const toolCallsWithArgumentDelta = new Set<string>();
+    let collectedReasoning = '';
+    const reasoningPartKeysWithDelta = new Set<string>();
+    const reasoningPartKeysWithDone = new Set<string>();
+    const reasoningItemsWithEvents = new Set<string>();
 
     const sseIter = parseSSE(upstreamBody);
+
+    function reasoningPartKey(
+        itemId: string | undefined,
+        partKind: 'content' | 'summary',
+        partIndex: number | undefined,
+    ): string | undefined {
+        if (!itemId) return undefined;
+        return `${itemId}:${partKind}:${String(partIndex ?? 0)}`;
+    }
+
+    function collectDoneText(
+        itemId: string | undefined,
+        text: string | undefined,
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        encoder: InstanceType<typeof TextEncoder>,
+        chatId: string,
+        created: number,
+        model: string,
+        wantsStream: boolean,
+    ): void {
+        if (!text) return;
+        if (itemId && (itemsWithTextDelta.has(itemId) || itemsWithDoneText.has(itemId))) {
+            return;
+        }
+
+        if (itemId) itemsWithDoneText.add(itemId);
+
+        if (wantsStream) {
+            controller.enqueue(encoder.encode(
+                `data: ${JSON.stringify({
+                    id: chatId, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                })}\n\n`
+            ));
+            return;
+        }
+
+        collectedText += text;
+    }
+
+    function emitToolCallStart(
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        encoder: InstanceType<typeof TextEncoder>,
+        chatId: string,
+        created: number,
+        model: string,
+        idx: number,
+        callId: string,
+        name: string,
+    ): void {
+        controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({
+                id: chatId, object: 'chat.completion.chunk', created, model,
+                choices: [{
+                    index: 0,
+                    delta: {
+                        tool_calls: [{
+                            index: idx, id: callId, type: 'function',
+                            function: { name, arguments: '' },
+                        }],
+                    },
+                    finish_reason: null,
+                }],
+            })}\n\n`
+        ));
+    }
+
+    function ensureToolCall(
+        callId: string,
+        itemId: string | undefined,
+        name: string,
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        encoder: InstanceType<typeof TextEncoder>,
+        chatId: string,
+        created: number,
+        model: string,
+        wantsStream: boolean,
+    ): number {
+        let idx = toolIndexByCallId.get(callId);
+        if (idx === undefined && itemId) {
+            idx = toolIndexByCallId.get(itemId);
+        }
+
+        if (idx === undefined) {
+            idx = nextToolIndex++;
+            if (wantsStream) {
+                emitToolCallStart(controller, encoder, chatId, created, model, idx, callId, name);
+            } else {
+                collectedToolCalls.push({
+                    id: callId,
+                    type: 'function',
+                    function: { name, arguments: '' },
+                });
+            }
+        }
+
+        toolIndexByCallId.set(callId, idx);
+        if (itemId) {
+            toolIndexByCallId.set(itemId, idx);
+            itemIdToCallId.set(itemId, callId);
+        }
+
+        if (!wantsStream && !collectedToolCalls.some(t => t.id === callId)) {
+            collectedToolCalls.push({
+                id: callId,
+                type: 'function',
+                function: { name, arguments: '' },
+            });
+        }
+
+        return idx;
+    }
+
+    function collectDoneToolArguments(
+        callId: string,
+        itemId: string | undefined,
+        name: string,
+        args: string | undefined,
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        encoder: InstanceType<typeof TextEncoder>,
+        chatId: string,
+        created: number,
+        model: string,
+        wantsStream: boolean,
+    ): void {
+        const idx = ensureToolCall(callId, itemId, name, controller, encoder, chatId, created, model, wantsStream);
+        if (!args) return;
+
+        if (wantsStream) {
+            const hasArgumentDelta = toolCallsWithArgumentDelta.has(callId)
+                || (itemId ? toolCallsWithArgumentDelta.has(itemId) : false);
+            if (!hasArgumentDelta) {
+                controller.enqueue(encoder.encode(
+                    `data: ${JSON.stringify({
+                        id: chatId, object: 'chat.completion.chunk', created, model,
+                        choices: [{
+                            index: 0,
+                            delta: {
+                                tool_calls: [{
+                                    index: idx,
+                                    function: { arguments: args },
+                                }],
+                            },
+                            finish_reason: null,
+                        }],
+                    })}\n\n`
+                ));
+            }
+            return;
+        }
+
+        const tc = collectedToolCalls.find(t => t.id === callId);
+        if (tc) tc.function.arguments = args;
+    }
+
+    function collectReasoning(
+        text: string | undefined,
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        encoder: InstanceType<typeof TextEncoder>,
+        chatId: string,
+        created: number,
+        model: string,
+        wantsStream: boolean,
+    ): void {
+        if (!text) return;
+
+        if (wantsStream) {
+            controller.enqueue(encoder.encode(
+                `data: ${JSON.stringify({
+                    id: chatId, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }],
+                })}\n\n`
+            ));
+            return;
+        }
+
+        collectedReasoning += text;
+    }
+
+    function collectReasoningDelta(
+        itemId: string | undefined,
+        partKey: string | undefined,
+        text: string | undefined,
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        encoder: InstanceType<typeof TextEncoder>,
+        chatId: string,
+        created: number,
+        model: string,
+        wantsStream: boolean,
+    ): void {
+        if (partKey) reasoningPartKeysWithDelta.add(partKey);
+        if (itemId) reasoningItemsWithEvents.add(itemId);
+        collectReasoning(text, controller, encoder, chatId, created, model, wantsStream);
+    }
+
+    function collectDoneReasoning(
+        itemId: string | undefined,
+        partKey: string | undefined,
+        text: string | undefined,
+        controller: ReadableStreamDefaultController<Uint8Array>,
+        encoder: InstanceType<typeof TextEncoder>,
+        chatId: string,
+        created: number,
+        model: string,
+        wantsStream: boolean,
+    ): void {
+        if (!text) return;
+        if (partKey && (reasoningPartKeysWithDelta.has(partKey) || reasoningPartKeysWithDone.has(partKey))) {
+            return;
+        }
+
+        if (partKey) reasoningPartKeysWithDone.add(partKey);
+        if (itemId) reasoningItemsWithEvents.add(itemId);
+        collectReasoning(text, controller, encoder, chatId, created, model, wantsStream);
+    }
+
+    function extractDoneItemText(item: Record<string, unknown> | undefined): string | undefined {
+        const content = item?.['content'];
+        if (!Array.isArray(content)) return undefined;
+
+        const text = content
+            .map(part => {
+                if (typeof part !== 'object' || part === null) return '';
+                return part['type'] === 'output_text' && typeof part['text'] === 'string'
+                    ? part['text']
+                    : '';
+            })
+            .join('');
+
+        return text.length > 0 ? text : undefined;
+    }
+
+    function extractDoneItemReasoning(item: Record<string, unknown> | undefined): string | undefined {
+        const summary = item?.['summary'];
+        const content = item?.['content'];
+        const parts: string[] = [];
+
+        if (Array.isArray(summary)) {
+            const summaryText = summary
+                .map(part => {
+                    if (typeof part !== 'object' || part === null) return '';
+                    return part['type'] === 'summary_text' && typeof part['text'] === 'string'
+                        ? part['text']
+                        : '';
+                })
+                .join('');
+            if (summaryText.length > 0) parts.push(summaryText);
+        }
+
+        if (Array.isArray(content)) {
+            const reasoningText = content
+                .map(part => {
+                    if (typeof part !== 'object' || part === null) return '';
+                    return part['type'] === 'reasoning_text' && typeof part['text'] === 'string'
+                        ? part['text']
+                        : '';
+                })
+                .join('');
+            if (reasoningText.length > 0) parts.push(reasoningText);
+        }
+
+        return parts.length > 0 ? parts.join('\n\n') : undefined;
+    }
+
+    function extractDoneFunctionCall(
+        item: Record<string, unknown> | undefined,
+    ): { callId: string; itemId: string | undefined; name: string; arguments: string | undefined } | undefined {
+        if (item?.['type'] !== 'function_call') return undefined;
+
+        const itemId = typeof item['id'] === 'string' ? item['id'] : undefined;
+        const callId = typeof item['call_id'] === 'string' ? item['call_id'] : itemId;
+        const name = typeof item['name'] === 'string' ? item['name'] : undefined;
+        const args = typeof item['arguments'] === 'string' ? item['arguments'] : undefined;
+
+        if (!callId || !name) return undefined;
+
+        return { callId, itemId, name, arguments: args };
+    }
 
     return new ReadableStream<Uint8Array>({
         async start(controller) {
@@ -714,7 +1030,9 @@ export function codexResponseToStream(
                     switch (sse.event) {
                         case 'response.output_text.delta': {
                             const delta = parsed['delta'] as string | undefined;
+                            const itemId = parsed['item_id'] as string | undefined;
                             if (!delta) break;
+                            if (itemId) itemsWithTextDelta.add(itemId);
                             if (wantsStream) {
                                 controller.enqueue(encoder.encode(
                                     `data: ${JSON.stringify({
@@ -728,6 +1046,84 @@ export function codexResponseToStream(
                             break;
                         }
 
+                        case 'response.output_text.done': {
+                            collectDoneText(
+                                parsed['item_id'] as string | undefined,
+                                parsed['text'] as string | undefined,
+                                controller,
+                                encoder,
+                                chatId,
+                                created,
+                                model,
+                                wantsStream,
+                            );
+                            break;
+                        }
+
+                        case 'response.reasoning_text.delta': {
+                            const itemId = parsed['item_id'] as string | undefined;
+                            collectReasoningDelta(
+                                itemId,
+                                reasoningPartKey(itemId, 'content', parsed['content_index'] as number | undefined),
+                                parsed['delta'] as string | undefined,
+                                controller,
+                                encoder,
+                                chatId,
+                                created,
+                                model,
+                                wantsStream,
+                            );
+                            break;
+                        }
+
+                        case 'response.reasoning_text.done': {
+                            const itemId = parsed['item_id'] as string | undefined;
+                            collectDoneReasoning(
+                                itemId,
+                                reasoningPartKey(itemId, 'content', parsed['content_index'] as number | undefined),
+                                parsed['text'] as string | undefined,
+                                controller,
+                                encoder,
+                                chatId,
+                                created,
+                                model,
+                                wantsStream,
+                            );
+                            break;
+                        }
+
+                        case 'response.reasoning_summary_text.delta': {
+                            const itemId = parsed['item_id'] as string | undefined;
+                            collectReasoningDelta(
+                                itemId,
+                                reasoningPartKey(itemId, 'summary', parsed['summary_index'] as number | undefined),
+                                parsed['delta'] as string | undefined,
+                                controller,
+                                encoder,
+                                chatId,
+                                created,
+                                model,
+                                wantsStream,
+                            );
+                            break;
+                        }
+
+                        case 'response.reasoning_summary_text.done': {
+                            const itemId = parsed['item_id'] as string | undefined;
+                            collectDoneReasoning(
+                                itemId,
+                                reasoningPartKey(itemId, 'summary', parsed['summary_index'] as number | undefined),
+                                parsed['text'] as string | undefined,
+                                controller,
+                                encoder,
+                                chatId,
+                                created,
+                                model,
+                                wantsStream,
+                            );
+                            break;
+                        }
+
                         case 'response.output_item.added': {
                             // Tool call start — data is nested under parsed['item']
                             const item = parsed['item'] as Record<string, unknown> | undefined;
@@ -736,35 +1132,55 @@ export function codexResponseToStream(
                                 const callId = item['call_id'] as string;
                                 const itemId = item['id'] as string | undefined;
                                 const name = item['name'] as string;
-                                const idx = nextToolIndex++;
-                                toolIndexByCallId.set(callId, idx);
-                                // argument delta events reference item_id, not call_id
-                                if (itemId) {
-                                    toolIndexByCallId.set(itemId, idx);
-                                    itemIdToCallId.set(itemId, callId);
-                                }
+                                ensureToolCall(callId, itemId, name, controller, encoder, chatId, created, model, wantsStream);
+                            }
+                            break;
+                        }
 
-                                if (wantsStream) {
-                                    controller.enqueue(encoder.encode(
-                                        `data: ${JSON.stringify({
-                                            id: chatId, object: 'chat.completion.chunk', created, model,
-                                            choices: [{
-                                                index: 0,
-                                                delta: {
-                                                    tool_calls: [{
-                                                        index: idx, id: callId, type: 'function',
-                                                        function: { name, arguments: '' },
-                                                    }],
-                                                },
-                                                finish_reason: null,
-                                            }],
-                                        })}\n\n`
-                                    ));
-                                } else {
-                                    collectedToolCalls.push({
-                                        id: callId, type: 'function',
-                                        function: { name, arguments: '' },
-                                    });
+                        case 'response.output_item.done': {
+                            const item = parsed['item'] as Record<string, unknown> | undefined;
+                            const itemType = item?.['type'] as string | undefined;
+                            if (itemType === 'message') {
+                                collectDoneText(
+                                    item?.['id'] as string | undefined,
+                                    extractDoneItemText(item),
+                                    controller,
+                                    encoder,
+                                    chatId,
+                                    created,
+                                    model,
+                                    wantsStream,
+                                );
+                            }
+                            if (itemType === 'reasoning' && !reasoningItemsWithEvents.has(item?.['id'] as string | undefined ?? '')) {
+                                const itemId = item?.['id'] as string | undefined;
+                                collectDoneReasoning(
+                                    itemId,
+                                    reasoningPartKey(itemId, 'summary', undefined),
+                                    extractDoneItemReasoning(item),
+                                    controller,
+                                    encoder,
+                                    chatId,
+                                    created,
+                                    model,
+                                    wantsStream,
+                                );
+                            }
+                            if (itemType === 'function_call') {
+                                const doneToolCall = extractDoneFunctionCall(item);
+                                if (doneToolCall) {
+                                    collectDoneToolArguments(
+                                        doneToolCall.callId,
+                                        doneToolCall.itemId,
+                                        doneToolCall.name,
+                                        doneToolCall.arguments,
+                                        controller,
+                                        encoder,
+                                        chatId,
+                                        created,
+                                        model,
+                                        wantsStream,
+                                    );
                                 }
                             }
                             break;
@@ -777,8 +1193,11 @@ export function codexResponseToStream(
                             if (!delta || !itemId) break;
                             // Look up index by item_id; fall back to using it as call_id
                             const callId = itemId;
+                            const resolvedCallId = itemIdToCallId.get(callId) ?? callId;
+                            toolCallsWithArgumentDelta.add(resolvedCallId);
+                            toolCallsWithArgumentDelta.add(itemId);
 
-                            const idx = toolIndexByCallId.get(callId);
+                            const idx = toolIndexByCallId.get(callId) ?? toolIndexByCallId.get(resolvedCallId);
                             if (wantsStream && idx !== undefined) {
                                 controller.enqueue(encoder.encode(
                                     `data: ${JSON.stringify({
@@ -798,14 +1217,36 @@ export function codexResponseToStream(
                             } else {
                                 // Append to collected tool call arguments
                                 // item_id → call_id lookup for non-streaming
-                                const resolvedCallId = itemIdToCallId.get(callId) ?? callId;
                                 const tc = collectedToolCalls.find(t => t.id === resolvedCallId);
                                 if (tc) tc.function.arguments += delta;
                             }
                             break;
                         }
 
-                        case 'response.completed': {
+                        case 'response.function_call_arguments.done': {
+                            const itemId = parsed['item_id'] as string | undefined;
+                            const name = parsed['name'] as string | undefined;
+                            const args = parsed['arguments'] as string | undefined;
+                            if (!itemId || !name) break;
+
+                            const callId = itemIdToCallId.get(itemId) ?? itemId;
+                            collectDoneToolArguments(
+                                callId,
+                                itemId,
+                                name,
+                                args,
+                                controller,
+                                encoder,
+                                chatId,
+                                created,
+                                model,
+                                wantsStream,
+                            );
+                            break;
+                        }
+
+                        case 'response.completed':
+                        case 'response.incomplete': {
                             const response = parsed['response'] as Record<string, unknown> | undefined;
                             const usage = response?.['usage'] as Record<string, unknown> | undefined;
 
@@ -859,6 +1300,9 @@ export function codexResponseToStream(
                         role: 'assistant',
                         content: collectedText.length > 0 ? collectedText : null,
                     };
+                    if (collectedReasoning.length > 0) {
+                        message['reasoning_content'] = collectedReasoning;
+                    }
                     if (collectedToolCalls.length > 0) {
                         message['tool_calls'] = collectedToolCalls;
                     }

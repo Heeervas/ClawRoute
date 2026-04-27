@@ -114,6 +114,10 @@ describe('Model Endpoints', () => {
             const model = body.data[0];
 
             expect(typeof model.max_context).toBe('number');
+            expect(typeof model.context_length).toBe('number');
+            expect(typeof model.max_model_len).toBe('number');
+            expect(model.context_length).toBe(model.max_context);
+            expect(model.max_model_len).toBe(model.max_context);
             expect(typeof model.tool_capable).toBe('boolean');
             expect(typeof model.multimodal).toBe('boolean');
         });
@@ -151,6 +155,8 @@ describe('Model Endpoints', () => {
             expect(body.object).toBe('model');
             expect(typeof body.created).toBe('number');
             expect(typeof body.owned_by).toBe('string');
+            expect(body.context_length).toBe(body.max_context);
+            expect(body.max_model_len).toBe(body.max_context);
         });
 
         it('should handle multi-slash model IDs (e.g., openrouter/google/gemini-2.5-flash)', async () => {

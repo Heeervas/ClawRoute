@@ -9,7 +9,7 @@
  */
 
 import initSqlJs, { Database } from 'sql.js';
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, renameSync } from 'fs';
 import { join, dirname, resolve } from 'path';
 import {
     ClawRouteConfig,
@@ -23,6 +23,79 @@ import {
 let db: Database | null = null;
 let dbPath: string = '';
 
+const ROUTING_LOG_SCHEMA = `
+    CREATE TABLE IF NOT EXISTS routing_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        original_model TEXT NOT NULL,
+        routed_model TEXT NOT NULL,
+        actual_model TEXT NOT NULL,
+        tier TEXT NOT NULL,
+        classification_reason TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 0,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        original_cost_usd REAL NOT NULL DEFAULT 0,
+        actual_cost_usd REAL NOT NULL DEFAULT 0,
+        savings_usd REAL NOT NULL DEFAULT 0,
+        escalated INTEGER NOT NULL DEFAULT 0,
+        escalation_chain TEXT NOT NULL DEFAULT '[]',
+        response_time_ms INTEGER NOT NULL DEFAULT 0,
+        had_tool_calls INTEGER NOT NULL DEFAULT 0,
+        is_dry_run INTEGER NOT NULL DEFAULT 0,
+        is_override INTEGER NOT NULL DEFAULT 0,
+        session_id TEXT,
+        error TEXT,
+        prompt_preview TEXT,
+        context_info TEXT
+    )
+`;
+
+const ROUTING_LOG_INDEX = `
+    CREATE INDEX IF NOT EXISTS idx_routing_log_timestamp
+    ON routing_log (timestamp)
+`;
+
+const OPTIONAL_COLUMNS = [
+    'prompt_preview TEXT',
+    'context_info TEXT',
+];
+
+type SqlJsModule = Awaited<ReturnType<typeof initSqlJs>>;
+
+function initializeSchema(database: Database): void {
+    database.run(ROUTING_LOG_SCHEMA);
+
+    for (const colDef of OPTIONAL_COLUMNS) {
+        try {
+            database.run(`ALTER TABLE routing_log ADD COLUMN ${colDef}`);
+        } catch {
+            // Column already exists — safe to ignore
+        }
+    }
+
+    database.run(ROUTING_LOG_INDEX);
+}
+
+function recoverCorruptDatabase(SQL: SqlJsModule, error: unknown): Database {
+    const backupPath = `${dbPath}.corrupt-${Date.now()}`;
+
+    try {
+        renameSync(dbPath, backupPath);
+    } catch (backupError) {
+        throw new Error(
+            `Failed to recover corrupted ClawRoute database at ${dbPath}. ` +
+            `Original error: ${String(error)}. Backup error: ${String(backupError)}`
+        );
+    }
+
+    console.warn(`Recovered corrupted ClawRoute database: moved ${dbPath} to ${backupPath}`);
+
+    const freshDb = new SQL.Database();
+    initializeSchema(freshDb);
+    return freshDb;
+}
+
 // === Initialization ===
 
 /**
@@ -33,7 +106,9 @@ let dbPath: string = '';
  */
 export async function initDb(config: ClawRouteConfig): Promise<void> {
     const SQL = await initSqlJs();
-    dbPath = resolve(config.logging.dbPath);
+    dbPath = config.logging.dbPath === ':memory:'
+        ? ':memory:'
+        : resolve(config.logging.dbPath);
 
     // Ensure directory exists
     const dir = dirname(dbPath);
@@ -60,62 +135,28 @@ export async function initDb(config: ClawRouteConfig): Promise<void> {
         }
     }
 
-    // Load existing DB or create new
-    if (dbPath !== ':memory:' && existsSync(dbPath)) {
-        const fileBuffer = readFileSync(dbPath);
-        db = new SQL.Database(fileBuffer);
-    } else if (dbPath === ':memory:') {
-        db = new SQL.Database();
-    } else {
-        db = new SQL.Database();
-    }
+    const hasExistingDb = dbPath !== ':memory:' && existsSync(dbPath);
 
-    // Create tables
-    db.run(`
-        CREATE TABLE IF NOT EXISTS routing_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            original_model TEXT NOT NULL,
-            routed_model TEXT NOT NULL,
-            actual_model TEXT NOT NULL,
-            tier TEXT NOT NULL,
-            classification_reason TEXT NOT NULL DEFAULT '',
-            confidence REAL NOT NULL DEFAULT 0,
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            original_cost_usd REAL NOT NULL DEFAULT 0,
-            actual_cost_usd REAL NOT NULL DEFAULT 0,
-            savings_usd REAL NOT NULL DEFAULT 0,
-            escalated INTEGER NOT NULL DEFAULT 0,
-            escalation_chain TEXT NOT NULL DEFAULT '[]',
-            response_time_ms INTEGER NOT NULL DEFAULT 0,
-            had_tool_calls INTEGER NOT NULL DEFAULT 0,
-            is_dry_run INTEGER NOT NULL DEFAULT 0,
-            is_override INTEGER NOT NULL DEFAULT 0,
-            session_id TEXT,
-            error TEXT,
-            prompt_preview TEXT,
-            context_info TEXT
-        )
-    `);
-
-    // Migrate existing DBs: add new columns if they don't exist yet
-    for (const colDef of [
-        'prompt_preview TEXT',
-        'context_info TEXT',
-    ]) {
+    try {
+        db = hasExistingDb
+            ? new SQL.Database(readFileSync(dbPath))
+            : new SQL.Database();
+        initializeSchema(db);
+    } catch (error) {
         try {
-            db.run(`ALTER TABLE routing_log ADD COLUMN ${colDef}`);
+            db?.close();
         } catch {
-            // Column already exists — safe to ignore
+            // Best-effort cleanup for partially opened databases.
         }
-    }
 
-    // Create indexes for common queries
-    db.run(`
-        CREATE INDEX IF NOT EXISTS idx_routing_log_timestamp
-        ON routing_log (timestamp)
-    `);
+        db = null;
+
+        if (!hasExistingDb || dbPath === ':memory:') {
+            throw error;
+        }
+
+        db = recoverCorruptDatabase(SQL, error);
+    }
 
     // Persist initial state
     persistDb();
