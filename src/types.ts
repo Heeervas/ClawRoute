@@ -58,6 +58,22 @@ export interface ClassificationResult {
  */
 export type ProviderType = 'anthropic' | 'openai' | 'codex' | 'google' | 'deepseek' | 'openrouter' | 'ollama' | 'x-ai' | 'stepfun';
 
+export const PROVIDER_TYPES: ProviderType[] = [
+    'anthropic',
+    'openai',
+    'codex',
+    'google',
+    'deepseek',
+    'openrouter',
+    'ollama',
+    'x-ai',
+    'stepfun',
+];
+
+export function isProviderType(value: unknown): value is ProviderType {
+    return typeof value === 'string' && PROVIDER_TYPES.includes(value as ProviderType);
+}
+
 /**
  * Model entry with cost and capability information.
  */
@@ -156,6 +172,22 @@ export interface TierModelConfig {
     primary: string;
     /** Fallback model ID if primary unavailable */
     fallback: string;
+}
+
+/**
+ * File-backed routing snapshot that can be rebuilt without restarting the server.
+ */
+export interface RoutingSnapshot {
+    /** Selected provider profile */
+    providerProfile: string | null;
+    /** Model used for savings comparison */
+    baselineModel: string;
+    /** Tier mappings used by routing */
+    models: Record<TaskTier, TierModelConfig>;
+    /** Per-model context overrides */
+    contextOverrides?: Record<string, number>;
+    /** Frozen model catalog for this snapshot */
+    modelCatalog: ModelEntry[];
 }
 
 /**

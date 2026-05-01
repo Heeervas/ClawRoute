@@ -14,17 +14,24 @@ import {
     ChatCompletionRequest,
     ClawRouteConfig,
     LogEntry,
+    ModelEntry,
+    ProviderType,
+    RoutingSnapshot,
+    TaskTier,
+    isProviderType,
 } from './types.js';
 import { createAuthMiddleware } from './auth.js';
 import { classifyRequest, explainClassification } from './classifier.js';
 import { routeRequest } from './router.js';
 import { executeRequest, executePassthrough } from './executor.js';
-import { getEnabledModels, getModelEntryStrict } from './models.js';
+import { cloneModelCatalog, deleteModel, getEnabledModelsFromCatalog, getModelEntryFromCatalog, getModelEntryStrictFromCatalog, registerModel } from './models.js';
 import { logRouting } from './logger.js';
 import { getStatsResponse } from './stats.js';
-import { getRedactedConfig } from './config.js';
+import { getRedactedConfig, persistModelRegistryEntry, persistModelRemoval, persistTierSelection } from './config.js';
 import { generateRequestId, nowIso, stripMetadataPreamble } from './utils.js';
 import { responsesBodyToChatCompletions, chatCompletionToResponsesBody, responsesBodyToSSEResponse } from './responses-adapter.js';
+import { discoverProviderModels, DiscoveredModelCandidate, getCandidateMissingFields } from './provider-discovery.js';
+import { RuntimeStateManager } from './runtime-state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -35,8 +42,127 @@ const __dirname = dirname(__filename);
  * @param config - The ClawRoute configuration
  * @returns Configured Hono app
  */
-export function createApp(config: ClawRouteConfig): Hono {
+type CreateAppOptions = {
+    projectRoot?: string;
+    runtimeState?: RuntimeStateManager;
+};
+
+export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {}): Hono {
     const app = new Hono();
+    const discoveredCandidates = new Map<string, DiscoveredModelCandidate>();
+
+    function getRuntimeSnapshot(): RoutingSnapshot {
+        if (!options.runtimeState) {
+            return {
+                providerProfile: config.providerProfile,
+                baselineModel: config.baselineModel,
+                models: config.models,
+                contextOverrides: config.contextOverrides,
+                modelCatalog: cloneModelCatalog(),
+            };
+        }
+
+        return options.runtimeState.getSnapshot();
+    }
+
+    function getRuntimeConfigFromSnapshot(snapshot: RoutingSnapshot): ClawRouteConfig {
+        return {
+            ...config,
+            providerProfile: snapshot.providerProfile,
+            baselineModel: snapshot.baselineModel,
+            models: snapshot.models,
+            contextOverrides: snapshot.contextOverrides,
+        };
+    }
+
+    function getRuntimeConfig(): ClawRouteConfig {
+        return getRuntimeConfigFromSnapshot(getRuntimeSnapshot());
+    }
+
+    async function reloadRuntime(reason: string): Promise<void> {
+        if (!options.runtimeState) {
+            return;
+        }
+        await options.runtimeState.reloadNow(reason);
+    }
+
+    function getMissingFields(body: Partial<ModelEntry>): DiscoveredModelCandidate['missingFields'] {
+        return getCandidateMissingFields(body);
+    }
+
+    function getInvalidFields(body: Partial<ModelEntry>): string[] {
+        const invalidFields: string[] = [];
+        if (body.maxContext !== undefined) {
+            if (typeof body.maxContext !== 'number' || !Number.isFinite(body.maxContext) || body.maxContext <= 0) {
+                invalidFields.push('maxContext');
+            }
+        }
+        if (body.inputCostPer1M !== undefined) {
+            if (typeof body.inputCostPer1M !== 'number' || !Number.isFinite(body.inputCostPer1M) || body.inputCostPer1M < 0) {
+                invalidFields.push('inputCostPer1M');
+            }
+        }
+        if (body.outputCostPer1M !== undefined) {
+            if (typeof body.outputCostPer1M !== 'number' || !Number.isFinite(body.outputCostPer1M) || body.outputCostPer1M < 0) {
+                invalidFields.push('outputCostPer1M');
+            }
+        }
+        if (body.toolCapable !== undefined && typeof body.toolCapable !== 'boolean') {
+            invalidFields.push('toolCapable');
+        }
+        if (body.multimodal !== undefined && typeof body.multimodal !== 'boolean') {
+            invalidFields.push('multimodal');
+        }
+        if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+            invalidFields.push('enabled');
+        }
+        return invalidFields;
+    }
+
+    async function applyPersistentChange(
+        write: () => () => void,
+        reason: string
+    ): Promise<void> {
+        const rollback = write();
+        try {
+            await reloadRuntime(reason);
+        } catch (error) {
+            rollback();
+            try {
+                await reloadRuntime(`${reason} rollback`);
+            } catch {
+                // Best effort to restore the last known-good snapshot.
+            }
+            throw error;
+        }
+    }
+
+    function isConfiguredTier(tier: string): tier is TaskTier {
+        return Object.values(TaskTier).includes(tier as TaskTier);
+    }
+
+    function isDiscoveryOnly(modelId: string): boolean {
+        const candidate = discoveredCandidates.get(modelId);
+        return candidate?.discoveryOnly ?? false;
+    }
+
+    function isAllowedModel(modelId: string): boolean {
+        const entry = getModelEntryFromCatalog(modelId, getRuntimeSnapshot().modelCatalog);
+        if (!entry || !entry.enabled) return false;
+        return !isDiscoveryOnly(modelId);
+    }
+
+    function hasModelReference(modelId: string): boolean {
+        const runtimeConfig = getRuntimeConfig();
+        if (runtimeConfig.baselineModel === modelId) {
+            return true;
+        }
+
+        return Object.values(TaskTier).some((tier) => {
+            const tierConfig = runtimeConfig.models[tier];
+            return tierConfig.primary === modelId || tierConfig.fallback === modelId;
+        });
+    }
 
     // CORS for dashboard
     app.use('*', cors());
@@ -116,6 +242,190 @@ export function createApp(config: ClawRouteConfig): Hono {
     app.get('/api/config', (c) => {
         const redacted = getRedactedConfig(config);
         return c.json(redacted);
+    });
+
+    app.post('/api/admin/models/discover', async (c) => {
+        try {
+            const body = await c.req.json() as { provider?: ProviderType };
+            if (!body.provider) {
+                return c.json({ error: { message: 'Provide provider', type: 'invalid_request_error', code: 'invalid_body' } }, 400);
+            }
+            if (!isProviderType(body.provider)) {
+                return c.json({ error: { message: `Unknown provider: ${String(body.provider)}`, type: 'invalid_request_error', code: 'invalid_provider' } }, 400);
+            }
+
+            const candidates = await discoverProviderModels(body.provider, getRuntimeConfig());
+            for (const candidate of candidates) {
+                discoveredCandidates.set(candidate.id, candidate);
+            }
+            return c.json({ candidates });
+        } catch (error) {
+            return c.json({
+                error: {
+                    message: error instanceof Error ? error.message : 'Failed to discover models',
+                    type: 'invalid_request_error',
+                    code: 'discovery_failed',
+                },
+            }, 400);
+        }
+    });
+
+    app.post('/api/admin/models', async (c) => {
+        let body: Partial<ModelEntry>;
+        try {
+            body = await c.req.json() as Partial<ModelEntry>;
+        } catch {
+            return c.json({ error: { message: 'Invalid JSON body', type: 'invalid_request_error', code: 'invalid_json' } }, 400);
+        }
+
+        try {
+            if (!body.id || !body.provider) {
+                return c.json({
+                    error: {
+                        message: 'Provide id and provider',
+                        type: 'invalid_request_error',
+                        code: 'invalid_body',
+                    },
+                    missingFields: body.id ? ['provider'] : ['id', 'provider'],
+                }, 400);
+            }
+            if (!isProviderType(body.provider)) {
+                return c.json({
+                    error: {
+                        message: `Unknown provider: ${String(body.provider)}`,
+                        type: 'invalid_request_error',
+                        code: 'invalid_provider',
+                    },
+                }, 400);
+            }
+
+            const missingFields = getMissingFields(body);
+            if (missingFields.length > 0) {
+                discoveredCandidates.set(body.id, {
+                    id: body.id,
+                    provider: body.provider,
+                    discoveryOnly: true,
+                    missingFields,
+                });
+                return c.json({
+                    error: {
+                        message: 'Incomplete model metadata',
+                        type: 'invalid_request_error',
+                        code: 'incomplete_model',
+                    },
+                    missingFields,
+                }, 400);
+            }
+
+            const invalidFields = getInvalidFields(body);
+            if (invalidFields.length > 0) {
+                return c.json({
+                    error: {
+                        message: 'Invalid model metadata',
+                        type: 'invalid_request_error',
+                        code: 'invalid_model',
+                    },
+                    invalidFields,
+                }, 400);
+            }
+
+            const model: ModelEntry = {
+                id: body.id,
+                provider: body.provider,
+                inputCostPer1M: body.inputCostPer1M ?? 0,
+                outputCostPer1M: body.outputCostPer1M ?? 0,
+                maxContext: body.maxContext ?? 0,
+                toolCapable: body.toolCapable ?? false,
+                multimodal: body.multimodal ?? false,
+                enabled: body.enabled ?? false,
+            };
+
+            if (options.projectRoot) {
+                await applyPersistentChange(
+                    () => persistModelRegistryEntry(options.projectRoot!, model),
+                    `admin add model ${model.id}`
+                );
+            } else {
+                registerModel(model);
+            }
+            discoveredCandidates.delete(model.id);
+            return c.json({ success: true, model });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Invalid JSON body';
+            return c.json({ error: { message, type: 'invalid_request_error', code: 'reload_failed' } }, 400);
+        }
+    });
+
+    app.post('/api/admin/tiers/:tier', async (c) => {
+        let body: { primary?: string; fallback?: string };
+        try {
+            const tier = c.req.param('tier');
+            if (!isConfiguredTier(tier)) {
+                return c.json({ error: { message: `Unknown tier: ${tier}`, type: 'invalid_request_error', code: 'unknown_tier' } }, 404);
+            }
+
+            try {
+                body = await c.req.json() as { primary?: string; fallback?: string };
+            } catch {
+                return c.json({ error: { message: 'Invalid JSON body', type: 'invalid_request_error', code: 'invalid_json' } }, 400);
+            }
+            if (!body.primary || !body.fallback) {
+                return c.json({ error: { message: 'Provide primary and fallback', type: 'invalid_request_error', code: 'invalid_body' } }, 400);
+            }
+
+            if (!isAllowedModel(body.primary) || !isAllowedModel(body.fallback)) {
+                return c.json({
+                    error: {
+                        message: 'Tier assignments must target complete, enabled, non-discovery-only models',
+                        type: 'invalid_request_error',
+                        code: 'invalid_model_target',
+                    },
+                }, 400);
+            }
+
+            const nextConfig = { primary: body.primary, fallback: body.fallback };
+            if (options.projectRoot) {
+                await applyPersistentChange(
+                    () => persistTierSelection(options.projectRoot!, tier, nextConfig),
+                    `admin update tier ${tier}`
+                );
+            } else {
+                config.models[tier] = nextConfig;
+            }
+            return c.json({ success: true, tier, config: nextConfig });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to update tier';
+            return c.json({ error: { message, type: 'invalid_request_error', code: 'reload_failed' } }, 400);
+        }
+    });
+
+    app.delete('/api/admin/models/:id{.+}', async (c) => {
+        const modelId = c.req.param('id');
+        if (hasModelReference(modelId)) {
+            return c.json({
+                error: {
+                    message: `Model ${modelId} is still referenced by baselineModel or tier config`,
+                    type: 'invalid_request_error',
+                    code: 'model_referenced',
+                },
+            }, 409);
+        }
+
+        discoveredCandidates.delete(modelId);
+        if (options.projectRoot) {
+            try {
+                await applyPersistentChange(
+                    () => persistModelRemoval(options.projectRoot!, modelId),
+                    `admin remove model ${modelId}`
+                );
+            } catch (error) {
+                const message = error instanceof Error ? error.message : 'Failed to remove model';
+                return c.json({ error: { message, type: 'invalid_request_error', code: 'reload_failed' } }, 400);
+            }
+        } else {
+            deleteModel(modelId);
+        }
+        return c.json({ success: true, id: modelId });
     });
 
     // Enable/disable controls
@@ -216,29 +526,31 @@ export function createApp(config: ClawRouteConfig): Hono {
         try {
             // Parse request body
             const body = await c.req.json() as ChatCompletionRequest;
+            const runtimeSnapshot = getRuntimeSnapshot();
+            const runtimeConfig = getRuntimeConfigFromSnapshot(runtimeSnapshot);
 
             if (config.logging.debugMode) {
                 console.log(`[${requestId}] Incoming request for model: ${body.model}`);
             }
 
             // If ClawRoute is disabled, passthrough
-            if (!config.enabled) {
+            if (!runtimeConfig.enabled) {
                 if (config.logging.debugMode) {
                     console.log(`[${requestId}] Passthrough (disabled)`);
                 }
-                const response = await executePassthrough(body, config);
+                const response = await executePassthrough(body, runtimeConfig, runtimeSnapshot.modelCatalog);
                 return response;
             }
 
             // Classify the request
-            const classification = classifyRequest(body, config);
+            const classification = classifyRequest(body, runtimeConfig);
 
             if (config.logging.debugMode) {
                 console.log(`[${requestId}] Classification: ${explainClassification(classification)}`);
             }
 
             // Route to model
-            const routing = routeRequest(body, classification, config);
+            const routing = routeRequest(body, classification, runtimeConfig, runtimeSnapshot.modelCatalog);
 
             if (config.logging.debugMode) {
                 console.log(
@@ -247,7 +559,7 @@ export function createApp(config: ClawRouteConfig): Hono {
             }
 
             // Execute the request
-            const result = await executeRequest(body, routing, classification, config);
+            const result = await executeRequest(body, routing, classification, runtimeConfig, runtimeSnapshot.modelCatalog);
 
             // Build the log entry for this request.
             // For streaming: called by executor after stream completes (accurate tokens).
@@ -334,7 +646,7 @@ export function createApp(config: ClawRouteConfig): Hono {
 
             try {
                 const body = await c.req.json() as ChatCompletionRequest;
-                const response = await executePassthrough(body, config);
+                const response = await executePassthrough(body, config, getRuntimeSnapshot().modelCatalog);
                 return response;
             } catch {
                 return c.json(
@@ -359,6 +671,8 @@ export function createApp(config: ClawRouteConfig): Hono {
         try {
             const body = await c.req.json();
             wantsStream = body.stream === true;
+            const runtimeSnapshot = getRuntimeSnapshot();
+            const runtimeConfig = getRuntimeConfigFromSnapshot(runtimeSnapshot);
 
             if (!body.model) {
                 return c.json(
@@ -393,17 +707,17 @@ export function createApp(config: ClawRouteConfig): Hono {
             }
 
             // If ClawRoute is disabled, passthrough
-            if (!config.enabled) {
-                const response = await executePassthrough(ccRequest, config);
+            if (!runtimeConfig.enabled) {
+                const response = await executePassthrough(ccRequest, runtimeConfig, runtimeSnapshot.modelCatalog);
                 const ccJson = await response.json() as Record<string, unknown>;
                 const responsesBody = chatCompletionToResponsesBody(ccJson);
                 return wantsStream ? responsesBodyToSSEResponse(responsesBody) : c.json(responsesBody);
             }
 
             // Classify → Route → Execute
-            const classification = classifyRequest(ccRequest, config);
-            const routing = routeRequest(ccRequest, classification, config);
-            const result = await executeRequest(ccRequest, routing, classification, config);
+            const classification = classifyRequest(ccRequest, runtimeConfig);
+            const routing = routeRequest(ccRequest, classification, runtimeConfig, runtimeSnapshot.modelCatalog);
+            const result = await executeRequest(ccRequest, routing, classification, runtimeConfig, runtimeSnapshot.modelCatalog);
 
             // Translate CC response back to Responses API format
             const ccJson = await result.response.json() as Record<string, unknown>;
@@ -467,7 +781,8 @@ export function createApp(config: ClawRouteConfig): Hono {
 
     // OpenAI-compatible: List models
     app.get('/v1/models', (c) => {
-        const models = getEnabledModels();
+        const runtimeSnapshot = getRuntimeSnapshot();
+        const models = getEnabledModelsFromCatalog(runtimeSnapshot.modelCatalog);
 
         // Virtual model: clawroute/auto — agents can select this to let
         // ClawRoute classify and route to the best model automatically.
@@ -506,6 +821,7 @@ export function createApp(config: ClawRouteConfig): Hono {
 
     // OpenAI-compatible: Retrieve model
     app.get('/v1/models/:id{.+}', (c) => {
+        const runtimeSnapshot = getRuntimeSnapshot();
         const modelId = c.req.param('id');
 
         // Virtual model: clawroute/auto
@@ -524,7 +840,7 @@ export function createApp(config: ClawRouteConfig): Hono {
             });
         }
 
-        const entry = getModelEntryStrict(modelId);
+        const entry = getModelEntryStrictFromCatalog(modelId, runtimeSnapshot.modelCatalog);
         if (!entry || !entry.enabled) {
             return c.json({
                 error: {
@@ -549,7 +865,8 @@ export function createApp(config: ClawRouteConfig): Hono {
 
     // ClawRoute-specific: Full model info with costs
     app.get('/api/models', (c) => {
-        const models = getEnabledModels();
+        const runtimeSnapshot = getRuntimeSnapshot();
+        const models = getEnabledModelsFromCatalog(runtimeSnapshot.modelCatalog);
         return c.json({
             models: models.map(m => ({
                 id: m.id,

@@ -237,6 +237,16 @@ export const DEFAULT_MODELS: ModelEntry[] = [
         multimodal: true,
         enabled: true,
     },
+    {
+        id: 'codex/gpt-5.5',
+        provider: 'codex',
+        inputCostPer1M: 0,
+        outputCostPer1M: 0,
+        maxContext: 1050000,
+        toolCapable: true,
+        multimodal: true,
+        enabled: true,
+    },
     // Keep gpt-4.1 variants registered in case the subscription also allows them
     {
         id: 'codex/gpt-4.1-mini',
@@ -265,10 +275,56 @@ export const DEFAULT_MODELS: ModelEntry[] = [
  */
 const modelRegistry = new Map<string, ModelEntry>();
 
-// Initialize the registry with default models
-for (const model of DEFAULT_MODELS) {
-    modelRegistry.set(model.id, model);
+function cloneModelEntry(model: ModelEntry): ModelEntry {
+    return { ...model };
 }
+
+function getCatalogEntries(catalog?: ModelEntry[]): Array<[string, ModelEntry]> {
+    if (!catalog) {
+        return Array.from(modelRegistry.entries());
+    }
+    return catalog.map((model) => [model.id, model] as [string, ModelEntry]);
+}
+
+function findModelEntry(
+    modelId: string,
+    catalog: ModelEntry[] | undefined,
+    allowFuzzy: boolean
+): ModelEntry | null {
+    const entries = getCatalogEntries(catalog);
+
+    const exact = entries.find(([id]) => id === modelId)?.[1] ?? null;
+    if (exact) return exact;
+
+    for (const [id, entry] of entries) {
+        if (id.endsWith(`/${modelId}`) || modelId.endsWith(`/${id.split('/')[1]}`)) {
+            return entry;
+        }
+    }
+
+    if (!allowFuzzy) {
+        return null;
+    }
+
+    const normalizedId = modelId.toLowerCase();
+    for (const [id, entry] of entries) {
+        const normalizedEntryId = id.toLowerCase();
+        if (normalizedEntryId.includes(normalizedId) || normalizedId.includes(normalizedEntryId)) {
+            return entry;
+        }
+    }
+
+    return null;
+}
+
+export function resetModelRegistry(): void {
+    modelRegistry.clear();
+    for (const model of DEFAULT_MODELS) {
+        modelRegistry.set(model.id, cloneModelEntry(model));
+    }
+}
+
+resetModelRegistry();
 
 /**
  * Get a model entry by its ID.
@@ -277,27 +333,14 @@ for (const model of DEFAULT_MODELS) {
  * @returns The model entry or null if not found
  */
 export function getModelEntry(modelId: string): ModelEntry | null {
-    // First try exact match
-    const exact = modelRegistry.get(modelId);
-    if (exact) return exact;
+    return findModelEntry(modelId, undefined, true);
+}
 
-    // Try without provider prefix
-    for (const [id, entry] of modelRegistry) {
-        if (id.endsWith(`/${modelId}`) || modelId.endsWith(`/${id.split('/')[1]}`)) {
-            return entry;
-        }
-    }
-
-    // Try fuzzy match on model name
-    const normalizedId = modelId.toLowerCase();
-    for (const [id, entry] of modelRegistry) {
-        const normalizedEntryId = id.toLowerCase();
-        if (normalizedEntryId.includes(normalizedId) || normalizedId.includes(normalizedEntryId)) {
-            return entry;
-        }
-    }
-
-    return null;
+export function getModelEntryFromCatalog(
+    modelId: string,
+    catalog: ModelEntry[]
+): ModelEntry | null {
+    return findModelEntry(modelId, catalog, true);
 }
 
 /**
@@ -330,6 +373,23 @@ export function getProviderForModel(modelId: string): ProviderType {
     return 'openai';
 }
 
+export function getProviderForModelFromCatalog(
+    modelId: string,
+    catalog: ModelEntry[]
+): ProviderType {
+    if (modelId.includes('/')) {
+        const prefix = modelId.split('/')[0]?.toLowerCase();
+        if (prefix === 'anthropic' || prefix === 'openai' || prefix === 'codex' || prefix === 'google' || prefix === 'deepseek' || prefix === 'openrouter' || prefix === 'ollama' || prefix === 'x-ai' || prefix === 'stepfun') {
+            return prefix as ProviderType;
+        }
+    }
+
+    const entry = getModelEntryFromCatalog(modelId, catalog);
+    if (entry) return entry.provider;
+
+    return getProviderForModel(modelId);
+}
+
 /**
  * Calculate the cost for a request.
  *
@@ -355,6 +415,23 @@ export function calculateCost(
     const inputCost = (inputTokens / 1_000_000) * entry.inputCostPer1M;
     const outputCost = (outputTokens / 1_000_000) * entry.outputCostPer1M;
 
+    return inputCost + outputCost;
+}
+
+export function calculateCostFromCatalog(
+    modelId: string,
+    inputTokens: number,
+    outputTokens: number,
+    catalog: ModelEntry[]
+): number {
+    const entry = getModelEntryFromCatalog(modelId, catalog);
+
+    if (!entry) {
+        return calculateCost(modelId, inputTokens, outputTokens);
+    }
+
+    const inputCost = (inputTokens / 1_000_000) * entry.inputCostPer1M;
+    const outputCost = (outputTokens / 1_000_000) * entry.outputCostPer1M;
     return inputCost + outputCost;
 }
 
@@ -434,13 +511,25 @@ export function isToolCapable(modelId: string): boolean {
     return entry?.toolCapable ?? true; // Assume capable if unknown
 }
 
+export function isToolCapableFromCatalog(modelId: string, catalog: ModelEntry[]): boolean {
+    const entry = getModelEntryFromCatalog(modelId, catalog);
+    return entry?.toolCapable ?? true;
+}
+
 /**
  * Register a custom model.
  *
  * @param model - The model entry to register
  */
 export function registerModel(model: ModelEntry): void {
-    modelRegistry.set(model.id, model);
+    modelRegistry.set(model.id, cloneModelEntry(model));
+}
+
+/**
+ * Remove a model from the active registry.
+ */
+export function deleteModel(modelId: string): boolean {
+    return modelRegistry.delete(modelId);
 }
 
 /**
@@ -449,7 +538,11 @@ export function registerModel(model: ModelEntry): void {
  * @returns Array of all model entries
  */
 export function getAllModels(): ModelEntry[] {
-    return Array.from(modelRegistry.values());
+    return Array.from(modelRegistry.values()).map(cloneModelEntry);
+}
+
+export function cloneModelCatalog(): ModelEntry[] {
+    return getAllModels();
 }
 
 /**
@@ -459,23 +552,23 @@ export function getEnabledModels(): ModelEntry[] {
     return getAllModels().filter(m => m.enabled);
 }
 
+export function getEnabledModelsFromCatalog(catalog: ModelEntry[]): ModelEntry[] {
+    return catalog.filter((model) => model.enabled).map(cloneModelEntry);
+}
+
 /**
  * Get a model entry by exact or prefix match only (no fuzzy).
  * Used by API endpoints where fuzzy matching could be misleading.
  */
 export function getModelEntryStrict(modelId: string): ModelEntry | null {
-    // Exact match
-    const exact = modelRegistry.get(modelId);
-    if (exact) return exact;
+    return findModelEntry(modelId, undefined, false);
+}
 
-    // Try without provider prefix (e.g., "google/gemini-2.5-flash" matches "openrouter/google/gemini-2.5-flash")
-    for (const [id, entry] of modelRegistry) {
-        if (id.endsWith(`/${modelId}`) || modelId.endsWith(`/${id.split('/')[1]}`)) {
-            return entry;
-        }
-    }
-
-    return null;
+export function getModelEntryStrictFromCatalog(
+    modelId: string,
+    catalog: ModelEntry[]
+): ModelEntry | null {
+    return findModelEntry(modelId, catalog, false);
 }
 
 /**

@@ -190,6 +190,44 @@ describe('Executor Logic', () => {
         });
     });
 
+    describe('Codex Transport', () => {
+        it('should keep codex/gpt-5.5 on the Codex transport path', async () => {
+            vi.resetModules();
+            const makeCodexRequest = vi.fn().mockResolvedValue(createSuccessResponse('Codex gpt-5.5 response'));
+            vi.doMock('../src/codex-transport.js', () => ({ makeCodexRequest }));
+
+            try {
+                const { executeRequest } = await import('../src/executor.js');
+
+                const request = {
+                    model: 'codex/gpt-5.5',
+                    messages: [{ role: 'user' as const, content: 'test codex path' }],
+                    stream: false,
+                };
+                const routing = createRoutingDecision(
+                    'codex/gpt-5.5',
+                    'codex/gpt-5.5',
+                    TaskTier.MODERATE,
+                );
+                const classification = createClassification(TaskTier.MODERATE);
+                const config = createTestConfig();
+
+                const result = await executeRequest(request, routing, classification, config);
+                const codexCall = makeCodexRequest.mock.calls[0];
+
+                expect(makeCodexRequest).toHaveBeenCalledTimes(1);
+                expect(codexCall?.[0]).toMatchObject({ model: 'codex/gpt-5.5' });
+                expect(codexCall?.[1]).toBe('codex/gpt-5.5');
+                expect(mockFetch).not.toHaveBeenCalled();
+                expect(result.actualModel).toBe('codex/gpt-5.5');
+                expect(result.actualCostUsd).toBe(0);
+            } finally {
+                vi.doUnmock('../src/codex-transport.js');
+                vi.resetModules();
+            }
+        });
+    });
+
     describe('Escalation on Error', () => {
         it('should escalate on HTTP error when safe to retry', async () => {
             // First call fails, second succeeds

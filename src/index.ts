@@ -6,10 +6,11 @@
 
 import 'dotenv/config';
 import { serve } from '@hono/node-server';
-import { loadConfig } from './config.js';
+import { getProjectRoot, loadConfig } from './config.js';
 import { logAuthWarning } from './auth.js';
 import { initDb, pruneOldEntries, closeDb } from './logger.js';
 import { createApp } from './server.js';
+import { createRuntimeStateManager } from './runtime-state.js';
 // import { isProEnabled } from './router.js'; // Removed in v1.1
 import { getStartupSummary } from './stats.js';
 import { TaskTier } from './types.js';
@@ -52,7 +53,12 @@ async function main(): Promise<void> {
         console.log('🚀 Starting ClawRoute...\n');
 
         // Load configuration
+        const projectRoot = getProjectRoot();
         const config = loadConfig();
+        const runtimeState = createRuntimeStateManager({
+            projectRoot,
+            pollIntervalMs: 1000,
+        });
 
         // Log auth warning if needed
         logAuthWarning(config);
@@ -74,7 +80,7 @@ async function main(): Promise<void> {
         }
 
         // Create app
-        const app = createApp(config);
+        const app = createApp(config, { projectRoot, runtimeState });
 
         // Print banner
         printBanner(config);
@@ -92,6 +98,7 @@ async function main(): Promise<void> {
         // Graceful shutdown handlers
         const shutdown = (signal: string) => {
             console.log(`\n\n🛑 Received ${signal}, shutting down...`);
+            runtimeState.stop();
             closeDb();
             console.log('👋 ClawRoute stopped. Goodbye!');
             process.exit(0);

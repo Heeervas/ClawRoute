@@ -122,6 +122,19 @@ describe('Model Endpoints', () => {
             expect(typeof model.multimodal).toBe('boolean');
         });
 
+        it('should expose bundled codex/gpt-5.5 in the resolved catalog', async () => {
+            const res = await app.request('/v1/models');
+            const body = await res.json();
+
+            const model = body.data.find((entry: { id: string }) => entry.id === 'codex/gpt-5.5');
+
+            expect(model).toMatchObject({
+                id: 'codex/gpt-5.5',
+                owned_by: 'codex',
+                tool_capable: true,
+            });
+        });
+
         it('should only return enabled models', async () => {
             // Register a disabled model
             registerModel({

@@ -56,6 +56,10 @@ Commands:
   stats --week       Show this week's stats
   stats --month      Show this month's stats
   stats --all        Show all-time stats
+    models discover    Enumerate candidate models for a provider
+    models add         Add a model to the live/persisted ClawRoute catalog
+    models remove      Remove or disable a model from the ClawRoute catalog
+    tiers set          Change primary/fallback for a routing tier
   enable             Enable ClawRoute routing
   disable            Disable ClawRoute (passthrough mode)
   dry-run            Enable dry-run mode
@@ -68,12 +72,20 @@ Commands:
 Examples:
   clawroute start           # Start the proxy server
   clawroute stats           # Show today's stats
+    clawroute models discover codex
+    clawroute tiers set complex --primary codex/gpt-5.5 --fallback codex/gpt-5.4
   clawroute billing         # Show donation info
 
 Environment:
   CLAWROUTE_HOST     Target host for CLI commands (default: ${DEFAULT_HOST})
+    CLAWROUTE_TOKEN    Optional Bearer token for protected admin/API commands
 
 `);
+}
+
+function getAuthHeaders(): Record<string, string> {
+        const token = process.env['CLAWROUTE_TOKEN'];
+        return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 /**
@@ -88,9 +100,14 @@ async function request(
     const url = `${host}${path}`;
 
     try {
+        const authHeaders = getAuthHeaders();
+        const headers: Record<string, string> = { ...authHeaders };
+        if (body) {
+            headers['Content-Type'] = 'application/json';
+        }
         const response = await fetch(url, {
             method,
-            headers: body ? { 'Content-Type': 'application/json' } : undefined,
+            headers: Object.keys(headers).length > 0 ? headers : undefined,
             body: body ? JSON.stringify(body) : undefined,
         });
 
@@ -110,6 +127,13 @@ async function request(
         }
         throw error;
     }
+}
+
+function requireArg(value: string | undefined, message: string): string {
+    if (!value) {
+        throw new Error(message);
+    }
+    return value;
 }
 
 /**
@@ -243,6 +267,79 @@ async function disableDryRun(): Promise<void> {
     console.log('🚀 Dry-run mode disabled (live mode)');
 }
 
+async function discoverModels(provider: string): Promise<void> {
+    const response = await request('/api/admin/models/discover', 'POST', { provider }) as {
+        candidates: unknown[];
+    };
+    console.log(JSON.stringify(response, null, 2));
+}
+
+function parseFlag(args: string[], name: string): string | undefined {
+    const index = args.indexOf(name);
+    return index >= 0 ? args[index + 1] : undefined;
+}
+
+async function addModel(args: string[]): Promise<void> {
+    const id = requireArg(args[0], 'Provide model id');
+    const provider = requireArg(parseFlag(args, '--provider'), 'Provide --provider');
+    const maxContext = Number(requireArg(parseFlag(args, '--max-context'), 'Provide --max-context'));
+    const inputCostPer1M = Number(requireArg(parseFlag(args, '--input-cost'), 'Provide --input-cost'));
+    const outputCostPer1M = Number(requireArg(parseFlag(args, '--output-cost'), 'Provide --output-cost'));
+    const toolCapable = parseFlag(args, '--tool-capable') !== 'false';
+    const multimodal = parseFlag(args, '--multimodal') === 'true';
+    const enabled = parseFlag(args, '--enabled') !== 'false';
+    const response = await request('/api/admin/models', 'POST', {
+        id,
+        provider,
+        maxContext,
+        inputCostPer1M,
+        outputCostPer1M,
+        toolCapable,
+        multimodal,
+        enabled,
+    });
+    console.log(JSON.stringify(response, null, 2));
+}
+
+async function removeModel(modelId: string): Promise<void> {
+    const id = requireArg(modelId, 'Provide model id');
+    const response = await request(`/api/admin/models/${encodeURIComponent(id)}`, 'DELETE');
+    console.log(JSON.stringify(response, null, 2));
+}
+
+async function setTier(args: string[]): Promise<void> {
+    const tier = requireArg(args[0], 'Provide tier');
+    const primary = requireArg(parseFlag(args, '--primary'), 'Provide --primary');
+    const fallback = requireArg(parseFlag(args, '--fallback'), 'Provide --fallback');
+    const response = await request(`/api/admin/tiers/${tier}`, 'POST', { primary, fallback });
+    console.log(JSON.stringify(response, null, 2));
+}
+
+async function handleModelsCommand(args: string[]): Promise<void> {
+    const subcommand = args[0];
+    switch (subcommand) {
+        case 'discover':
+            await discoverModels(requireArg(args[1], 'Provide provider'));
+            return;
+        case 'add':
+            await addModel(args.slice(1));
+            return;
+        case 'remove':
+            await removeModel(requireArg(args[1], 'Provide model id'));
+            return;
+        default:
+            throw new Error(`Unknown models command: ${subcommand ?? 'undefined'}`);
+    }
+}
+
+async function handleTiersCommand(args: string[]): Promise<void> {
+    const subcommand = args[0];
+    if (subcommand !== 'set') {
+        throw new Error(`Unknown tiers command: ${subcommand ?? 'undefined'}`);
+    }
+    await setTier(args.slice(1));
+}
+
 // Note: Server starts via dynamic import in switch statement, this function is not needed
 
 /**
@@ -302,6 +399,14 @@ async function main(): Promise<void> {
 
         case 'billing':
             await showBilling();
+            break;
+
+        case 'models':
+            await handleModelsCommand(args.slice(1));
+            break;
+
+        case 'tiers':
+            await handleTiersCommand(args.slice(1));
             break;
 
         case 'license':

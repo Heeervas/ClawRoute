@@ -9,18 +9,20 @@
  * API keys are ONLY loaded from environment variables.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, renameSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import {
     ClawRouteConfig,
+    ModelEntry,
+    RoutingSnapshot,
     TaskTier,
     TierModelConfig,
     ProviderType,
     AlertsConfig,
 } from './types.js';
-import { applyContextOverrides } from './models.js';
+import { DEFAULT_MODELS, applyContextOverrides, cloneModelCatalog, getModelEntry, registerModel, resetModelRegistry } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -28,28 +30,267 @@ const __dirname = dirname(__filename);
 /**
  * Get the project root directory.
  */
-function getProjectRoot(): string {
+export function getProjectRoot(): string {
     // Go up from src/ or dist/ to project root
     return join(__dirname, '..');
 }
+
+type PersistedModelRegistry = {
+    models?: Record<string, Partial<ModelEntry>>;
+};
 
 /**
  * Load JSON config file safely.
  *
  * @param path - Path to the config file
- * @returns Parsed JSON or null if not found/invalid
+ * @returns Parsed JSON or null if not found
  */
 function loadJsonConfig(path: string): Record<string, unknown> | null {
-    try {
-        if (!existsSync(path)) {
-            return null;
-        }
-        const content = readFileSync(path, 'utf-8');
-        return JSON.parse(content) as Record<string, unknown>;
-    } catch (error) {
-        console.warn(`Warning: Failed to load config from ${path}:`, error);
+    if (!existsSync(path)) {
         return null;
     }
+
+    const content = readFileSync(path, 'utf-8');
+    try {
+        return JSON.parse(content) as Record<string, unknown>;
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to parse config from ${path}: ${message}`);
+    }
+}
+
+function cloneTierModels(
+    models: Record<TaskTier, TierModelConfig>
+): Record<TaskTier, TierModelConfig> {
+    return {
+        [TaskTier.HEARTBEAT]: { ...models[TaskTier.HEARTBEAT] },
+        [TaskTier.SIMPLE]: { ...models[TaskTier.SIMPLE] },
+        [TaskTier.MODERATE]: { ...models[TaskTier.MODERATE] },
+        [TaskTier.COMPLEX]: { ...models[TaskTier.COMPLEX] },
+        [TaskTier.FRONTIER_SONNET]: { ...models[TaskTier.FRONTIER_SONNET] },
+        [TaskTier.FRONTIER_OPUS]: { ...models[TaskTier.FRONTIER_OPUS] },
+    };
+}
+
+function getResolvedProfile(
+    defaultJson: Record<string, unknown> | null,
+    userJson: Record<string, unknown> | null,
+    env: NodeJS.ProcessEnv
+): string | null {
+    const envProfile = env['CLAWROUTE_PROVIDER'];
+    if (envProfile) return envProfile;
+
+    const userProfile = userJson?.['providerProfile'];
+    if (typeof userProfile === 'string' && userProfile.length > 0) {
+        return userProfile;
+    }
+
+    const defaultProfile = defaultJson?.['providerProfile'];
+    if (typeof defaultProfile === 'string' && defaultProfile.length > 0) {
+        return defaultProfile;
+    }
+
+    return null;
+}
+
+function loadProfileJson(
+    projectRoot: string,
+    profile: string | null
+): Record<string, unknown> | null {
+    if (!profile) return null;
+    const profilePath = join(projectRoot, 'config', 'providers', `${profile}.json`);
+    const profileJson = loadJsonConfig(profilePath);
+    if (!profileJson) {
+        console.warn(`⚠️  Provider profile "${profile}" not found at ${profilePath}. Ignoring.`);
+    }
+    return profileJson;
+}
+
+function getUserConfigPath(projectRoot: string): string {
+    return join(projectRoot, 'config', 'clawroute.json');
+}
+
+function getModelRegistryPath(projectRoot: string): string {
+    return join(projectRoot, 'config', 'model-registry.json');
+}
+
+function loadPersistedModelRegistry(projectRoot: string): PersistedModelRegistry {
+    const registry = loadJsonConfig(getModelRegistryPath(projectRoot));
+    return (registry as PersistedModelRegistry | null) ?? {};
+}
+
+function writeJsonFile(path: string, value: unknown): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const tempPath = `${path}.tmp`;
+    writeFileSync(tempPath, JSON.stringify(value, null, 2));
+    renameSync(tempPath, path);
+}
+
+function restoreFile(path: string, previous: string | null, fallback: unknown): void {
+    if (previous === null) {
+        writeJsonFile(path, fallback);
+        return;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, previous);
+}
+
+function isValidMaxContext(value: unknown): value is number {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function isValidCost(value: unknown): value is number {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isCompleteModelEntry(model: Partial<ModelEntry>): model is ModelEntry {
+    return typeof model.id === 'string'
+        && typeof model.provider === 'string'
+        && isValidMaxContext(model.maxContext)
+        && typeof model.toolCapable === 'boolean'
+        && typeof model.multimodal === 'boolean'
+        && typeof model.enabled === 'boolean'
+        && isValidCost(model.inputCostPer1M)
+        && isValidCost(model.outputCostPer1M);
+}
+
+function applyPersistedModelRegistry(projectRoot: string): void {
+    const persisted = loadPersistedModelRegistry(projectRoot).models ?? {};
+    for (const [id, override] of Object.entries(persisted)) {
+        const existing = getModelEntry(id);
+        if (existing) {
+            const merged = { ...existing, ...override, id, provider: override.provider ?? existing.provider };
+            if (!isCompleteModelEntry(merged)) {
+                throw new Error(`model-registry entry for ${id} is invalid`);
+            }
+            registerModel(merged);
+            continue;
+        }
+
+        const candidate = { ...override, id };
+        if (isCompleteModelEntry(candidate)) {
+            registerModel(candidate);
+            continue;
+        }
+
+        throw new Error(`model-registry entry for ${id} is incomplete`);
+    }
+}
+
+function hasEnabledModel(modelId: string): boolean {
+    const entry = getModelEntry(modelId);
+    return entry !== null && entry.enabled;
+}
+
+function loadWritableJson(path: string): Record<string, unknown> {
+    return loadJsonConfig(path) ?? {};
+}
+
+export function persistModelRegistryEntry(projectRoot: string, model: ModelEntry): () => void {
+    const registryPath = getModelRegistryPath(projectRoot);
+    const previous = existsSync(registryPath) ? readFileSync(registryPath, 'utf-8') : null;
+    const current = loadPersistedModelRegistry(projectRoot);
+    const models = { ...(current.models ?? {}) };
+    models[model.id] = { ...model };
+    writeJsonFile(registryPath, { models });
+    return () => restoreFile(registryPath, previous, { models: {} });
+}
+
+export function persistModelRemoval(projectRoot: string, modelId: string): () => void {
+    const registryPath = getModelRegistryPath(projectRoot);
+    const previous = existsSync(registryPath) ? readFileSync(registryPath, 'utf-8') : null;
+    const current = loadPersistedModelRegistry(projectRoot);
+    const models = { ...(current.models ?? {}) };
+    const isBundled = DEFAULT_MODELS.some((model) => model.id === modelId);
+
+    if (isBundled) {
+        models[modelId] = { ...(models[modelId] ?? {}), enabled: false };
+    } else {
+        delete models[modelId];
+    }
+
+    writeJsonFile(registryPath, { models });
+    return () => restoreFile(registryPath, previous, { models: {} });
+}
+
+export function persistTierSelection(
+    projectRoot: string,
+    tier: TaskTier,
+    tierConfig: TierModelConfig
+): () => void {
+    const userConfigPath = getUserConfigPath(projectRoot);
+    const previous = existsSync(userConfigPath) ? readFileSync(userConfigPath, 'utf-8') : null;
+    const current = loadWritableJson(userConfigPath);
+    const models = {
+        ...((current['models'] as Record<string, unknown> | undefined) ?? {}),
+        [tier]: tierConfig,
+    };
+    writeJsonFile(userConfigPath, { ...current, models });
+    return () => restoreFile(userConfigPath, previous, {});
+}
+
+function validateRoutingSnapshot(snapshot: RoutingSnapshot): void {
+    for (const tier of Object.values(TaskTier)) {
+        const tierConfig = snapshot.models[tier];
+        if (!tierConfig?.primary || !tierConfig?.fallback) {
+            throw new Error(`Missing routing model configuration for tier: ${tier}`);
+        }
+        if (!hasEnabledModel(tierConfig.primary)) {
+            throw new Error(`Unknown or disabled primary model for tier ${tier}: ${tierConfig.primary}`);
+        }
+        if (!hasEnabledModel(tierConfig.fallback)) {
+            throw new Error(`Unknown or disabled fallback model for tier ${tier}: ${tierConfig.fallback}`);
+        }
+    }
+
+    if (!hasEnabledModel(snapshot.baselineModel)) {
+        throw new Error(`Unknown or disabled baseline model: ${snapshot.baselineModel}`);
+    }
+}
+
+export function buildRoutingSnapshot(
+    projectRoot: string,
+    env: NodeJS.ProcessEnv = process.env
+): RoutingSnapshot {
+    const defaultConfigPath = join(projectRoot, 'config', 'default.json');
+    const userConfigPath = join(projectRoot, 'config', 'clawroute.json');
+    const defaultJson = loadJsonConfig(defaultConfigPath);
+    const userJson = loadJsonConfig(userConfigPath);
+    const resolvedProfile = getResolvedProfile(defaultJson, userJson, env);
+    const profileJson = loadProfileJson(projectRoot, resolvedProfile);
+
+    let snapshot: RoutingSnapshot = {
+        providerProfile: DEFAULT_CONFIG.providerProfile,
+        baselineModel: DEFAULT_CONFIG.baselineModel,
+        models: cloneTierModels(DEFAULT_TIER_MODELS),
+        contextOverrides: undefined,
+        modelCatalog: [],
+    };
+
+    if (defaultJson) {
+        snapshot = deepMerge(snapshot, defaultJson as Partial<RoutingSnapshot>);
+    }
+    if (profileJson) {
+        snapshot = deepMerge(snapshot, profileJson as Partial<RoutingSnapshot>);
+    }
+    if (userJson) {
+        snapshot = deepMerge(snapshot, userJson as Partial<RoutingSnapshot>);
+    }
+
+    snapshot.providerProfile = resolvedProfile;
+    if (env['CLAWROUTE_BASELINE_MODEL']) {
+        snapshot.baselineModel = env['CLAWROUTE_BASELINE_MODEL'];
+    }
+
+    resetModelRegistry();
+    applyPersistedModelRegistry(projectRoot);
+    if (snapshot.contextOverrides && Object.keys(snapshot.contextOverrides).length > 0) {
+        applyContextOverrides(snapshot.contextOverrides);
+    }
+    snapshot.modelCatalog = cloneModelCatalog();
+
+    validateRoutingSnapshot(snapshot);
+    return snapshot;
 }
 
 /**
@@ -331,10 +572,17 @@ function validateConfig(config: ClawRouteConfig): void {
  */
 export function loadConfig(): ClawRouteConfig {
     const projectRoot = getProjectRoot();
+    const defaultConfigPath = join(projectRoot, 'config', 'default.json');
+    const userConfigPath = join(projectRoot, 'config', 'clawroute.json');
+    const defaultJson = loadJsonConfig(defaultConfigPath);
+    const userJson = loadJsonConfig(userConfigPath);
+    const resolvedProfile = getResolvedProfile(defaultJson, userJson, process.env);
+    const profileJson = loadProfileJson(projectRoot, resolvedProfile);
 
     // Start with defaults
     let config: ClawRouteConfig = {
         ...DEFAULT_CONFIG,
+        models: cloneTierModels(DEFAULT_TIER_MODELS),
         apiKeys: loadApiKeys(),
         overrides: {
             globalForceModel: null,
@@ -343,32 +591,20 @@ export function loadConfig(): ClawRouteConfig {
     };
 
     // Load bundled default config
-    const defaultConfigPath = join(projectRoot, 'config', 'default.json');
-    const defaultJson = loadJsonConfig(defaultConfigPath);
     if (defaultJson) {
         config = deepMerge(config, defaultJson as Partial<ClawRouteConfig>);
     }
 
+    if (profileJson) {
+        config = deepMerge(config, profileJson as Partial<ClawRouteConfig>);
+    }
+
     // Load user config (if exists)
-    const userConfigPath = join(projectRoot, 'config', 'clawroute.json');
-    const userJson = loadJsonConfig(userConfigPath);
     if (userJson) {
         config = deepMerge(config, userJson as Partial<ClawRouteConfig>);
     }
 
-    // Resolve provider profile: env var > JSON config > null
-    // This must happen AFTER the JSON files are merged so default.json's providerProfile is visible,
-    // but BEFORE env vars so CLAWROUTE_PROVIDER can still override it.
-    const resolvedProfile = process.env['CLAWROUTE_PROVIDER'] || (config.providerProfile ?? null);
-    if (resolvedProfile) {
-        const profilePath = join(projectRoot, 'config', 'providers', `${resolvedProfile}.json`);
-        const profileJson = loadJsonConfig(profilePath);
-        if (profileJson) {
-            config = deepMerge(config, profileJson as Partial<ClawRouteConfig>);
-        } else {
-            console.warn(`⚠️  Provider profile "${resolvedProfile}" not found at ${profilePath}. Ignoring.`);
-        }
-    }
+    config.providerProfile = resolvedProfile;
 
     // Apply environment variable overrides
     config.enabled = parseBoolEnv(process.env['CLAWROUTE_ENABLED'], config.enabled);
@@ -400,13 +636,11 @@ export function loadConfig(): ClawRouteConfig {
     // v1.1: Load alerts configuration from environment
     config.alerts = loadAlertsConfig();
 
-    // Apply per-model maxContext overrides from config
-    if (config.contextOverrides && Object.keys(config.contextOverrides).length > 0) {
-        applyContextOverrides(config.contextOverrides);
-        if (config.logging.debugMode) {
-            console.log(`📏 Applied ${Object.keys(config.contextOverrides).length} context overrides`);
-        }
-    }
+    const routingSnapshot = buildRoutingSnapshot(projectRoot);
+    config.providerProfile = routingSnapshot.providerProfile;
+    config.baselineModel = routingSnapshot.baselineModel;
+    config.models = cloneTierModels(routingSnapshot.models);
+    config.contextOverrides = routingSnapshot.contextOverrides;
 
     // Validate the final configuration
     validateConfig(config);

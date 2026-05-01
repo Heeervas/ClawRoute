@@ -30,6 +30,7 @@
         "enabled": true
     },
     "contextOverrides": {
+        "codex/gpt-5.5": 1050000,
         "codex/gpt-5.4": 1050000,
         "codex/gpt-5.4-mini": 400000,
         "codex/gpt-4.1": 256000,

@@ -11,19 +11,19 @@
         },
         "moderate": {
             "primary": "codex/gpt-5.4",
-            "fallback": "codex/gpt-5.3-codex"
+            "fallback": "codex/gpt-5.4-mini"
         },
         "complex": {
             "primary": "codex/gpt-5.4",
-            "fallback": "codex/gpt-5.3-codex"
+            "fallback": "codex/gpt-5.4-mini"
         },
         "frontier-sonnet": {
             "primary": "codex/gpt-5.4",
-            "fallback": "codex/gpt-5.3-codex"
+            "fallback": "codex/gpt-5.4-mini"
         },
         "frontier-opus": {
             "primary": "codex/gpt-5.4",
-            "fallback": "codex/gpt-5.3-codex"
+            "fallback": "codex/gpt-5.4-mini"
         }
     }
 }

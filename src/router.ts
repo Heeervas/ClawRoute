@@ -2,11 +2,12 @@ import {
     ChatCompletionRequest,
     ClassificationResult,
     ClawRouteConfig,
+    ModelEntry,
     RoutingDecision,
     TaskTier,
 } from './types.js';
 import { hasApiKey } from './config.js';
-import { calculateCost, getModelEntryStrict, getProviderForModel } from './models.js';
+import { calculateCost, calculateCostFromCatalog, getModelEntryStrict, getModelEntryStrictFromCatalog, getProviderForModel, getProviderForModelFromCatalog } from './models.js';
 import { estimateMessagesTokens } from './utils.js';
 
 
@@ -22,7 +23,8 @@ import { estimateMessagesTokens } from './utils.js';
 export function routeRequest(
     request: ChatCompletionRequest,
     classification: ClassificationResult,
-    config: ClawRouteConfig
+    config: ClawRouteConfig,
+    modelCatalog?: ModelEntry[]
 ): RoutingDecision {
     const originalModel = request.model;
     const estimatedTokens = estimateMessagesTokens(request.messages);
@@ -76,9 +78,13 @@ export function routeRequest(
     if (!isOverride) {
         // 3b. Client-specified model bypass (skip for clawroute/* models)
         if (!request.model.startsWith('clawroute/')) {
-            const entry = getModelEntryStrict(request.model);
+            const entry = modelCatalog
+                ? getModelEntryStrictFromCatalog(request.model, modelCatalog)
+                : getModelEntryStrict(request.model);
             if (entry && entry.enabled) {
-                const provider = getProviderForModel(request.model);
+                const provider = modelCatalog
+                    ? getProviderForModelFromCatalog(request.model, modelCatalog)
+                    : getProviderForModel(request.model);
                 if (hasApiKey(config, provider)) {
                     routedModel = request.model;
                     reason = `client-specified: ${request.model}`;
@@ -94,13 +100,17 @@ export function routeRequest(
         // Normal tier routing (Any tier)
         if (tierConfig) {
             // Try primary model
-            const primaryProvider = getProviderForModel(tierConfig.primary);
+            const primaryProvider = modelCatalog
+                ? getProviderForModelFromCatalog(tierConfig.primary, modelCatalog)
+                : getProviderForModel(tierConfig.primary);
             if (hasApiKey(config, primaryProvider)) {
                 routedModel = tierConfig.primary;
                 reason = `tier ${tier}: primary model`;
             } else {
                 // Try fallback model
-                const fallbackProvider = getProviderForModel(tierConfig.fallback);
+                const fallbackProvider = modelCatalog
+                    ? getProviderForModelFromCatalog(tierConfig.fallback, modelCatalog)
+                    : getProviderForModel(tierConfig.fallback);
                 if (hasApiKey(config, fallbackProvider)) {
                     routedModel = tierConfig.fallback;
                     reason = `tier ${tier}: fallback model (primary unavailable)`;
@@ -129,8 +139,12 @@ export function routeRequest(
 
     // 6. Calculate estimated savings
     const comparisonModel = config.baselineModel || originalModel;
-    const originalCost = calculateCost(comparisonModel, estimatedTokens, estimatedOutputTokens);
-    const routedCost = calculateCost(routedModel, estimatedTokens, estimatedOutputTokens);
+    const originalCost = modelCatalog
+        ? calculateCostFromCatalog(comparisonModel, estimatedTokens, estimatedOutputTokens, modelCatalog)
+        : calculateCost(comparisonModel, estimatedTokens, estimatedOutputTokens);
+    const routedCost = modelCatalog
+        ? calculateCostFromCatalog(routedModel, estimatedTokens, estimatedOutputTokens, modelCatalog)
+        : calculateCost(routedModel, estimatedTokens, estimatedOutputTokens);
     const estimatedSavingsUsd = Math.max(0, originalCost - routedCost);
 
     return {
@@ -156,7 +170,8 @@ export function routeRequest(
  */
 export function getEscalatedModel(
     currentTier: TaskTier,
-    config: ClawRouteConfig
+    config: ClawRouteConfig,
+    modelCatalog?: ModelEntry[]
 ): { model: string; tier: TaskTier } | null {
     const tierOrder: TaskTier[] = [
         TaskTier.HEARTBEAT,
@@ -176,7 +191,9 @@ export function getEscalatedModel(
     // Try current tier's own fallback first (e.g. openrouter when Ollama fails)
     const currentTierConfig = config.models[currentTier];
     if (currentTierConfig) {
-        const fallbackProvider = getProviderForModel(currentTierConfig.fallback);
+        const fallbackProvider = modelCatalog
+            ? getProviderForModelFromCatalog(currentTierConfig.fallback, modelCatalog)
+            : getProviderForModel(currentTierConfig.fallback);
         if (hasApiKey(config, fallbackProvider)) {
             return { model: currentTierConfig.fallback, tier: currentTier };
         }
@@ -196,13 +213,17 @@ export function getEscalatedModel(
         if (!tierConfig) continue;
 
         // Try primary
-        const primaryProvider = getProviderForModel(tierConfig.primary);
+        const primaryProvider = modelCatalog
+            ? getProviderForModelFromCatalog(tierConfig.primary, modelCatalog)
+            : getProviderForModel(tierConfig.primary);
         if (hasApiKey(config, primaryProvider)) {
             return { model: tierConfig.primary, tier: nextTier };
         }
 
         // Try fallback
-        const fallbackProvider = getProviderForModel(tierConfig.fallback);
+        const fallbackProvider = modelCatalog
+            ? getProviderForModelFromCatalog(tierConfig.fallback, modelCatalog)
+            : getProviderForModel(tierConfig.fallback);
         if (hasApiKey(config, fallbackProvider)) {
             return { model: tierConfig.fallback, tier: nextTier };
         }

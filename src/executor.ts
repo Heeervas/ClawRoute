@@ -14,9 +14,10 @@ import {
     ExecutionResult,
     RoutingDecision,
     ClassificationResult,
+    ModelEntry,
     TaskTier,
 } from './types.js';
-import { getApiBaseUrl, getAuthHeader, calculateCost, getProviderForModel } from './models.js';
+import { calculateCost, calculateCostFromCatalog, getApiBaseUrl, getAuthHeader, getProviderForModel, getProviderForModelFromCatalog } from './models.js';
 import { getApiKey } from './config.js';
 import { getEscalatedModel } from './router.js';
 import { validateResponse } from './validator.js';
@@ -62,7 +63,8 @@ export async function executeRequest(
     request: ChatCompletionRequest,
     routingDecision: RoutingDecision,
     _classification: ClassificationResult,
-    config: ClawRouteConfig
+    config: ClawRouteConfig,
+    modelCatalog?: ModelEntry[]
 ): Promise<ExecutionResult> {
     const startTime = Date.now();
 
@@ -77,7 +79,7 @@ export async function executeRequest(
         );
         return buildExecutionResult(
             errResponse, routingDecision, routingDecision.routedModel,
-            false, [routingDecision.routedModel], 0, 0, false, startTime, config
+            false, [routingDecision.routedModel], 0, 0, false, startTime, config, modelCatalog
         );
     }
 
@@ -106,7 +108,7 @@ export async function executeRequest(
         while (retryCount <= maxRetries) {
             try {
                 // Make the request to the current model
-                response = await makeProviderRequest(request, currentModel, config, currentTier);
+                response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
 
                 // Check if we got an error BEFORE streaming starts
                 if (!response.ok) {
@@ -118,7 +120,7 @@ export async function executeRequest(
                         routingDecision.safeToRetry &&
                         canEscalate(currentTier, config)
                     ) {
-                        const escalation = getEscalatedModel(currentTier, config);
+                        const escalation = getEscalatedModel(currentTier, config, modelCatalog);
                         if (escalation) {
                             await sleep(config.escalation.retryDelayMs);
                             currentModel = escalation.model;
@@ -135,7 +137,7 @@ export async function executeRequest(
                     if (config.escalation.alwaysFallbackToOriginal && currentModel !== routingDecision.originalModel) {
                         currentModel = routingDecision.originalModel;
                         escalationChain.push(currentModel);
-                        response = await makeProviderRequest(request, currentModel, config, currentTier);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
                     }
                 }
 
@@ -149,7 +151,7 @@ export async function executeRequest(
                     retryCount < maxRetries &&
                     routingDecision.safeToRetry
                 ) {
-                    const escalation = getEscalatedModel(currentTier, config);
+                    const escalation = getEscalatedModel(currentTier, config, modelCatalog);
                     if (escalation) {
                         await sleep(config.escalation.retryDelayMs);
                         currentModel = escalation.model;
@@ -166,7 +168,7 @@ export async function executeRequest(
                     currentModel = routingDecision.originalModel;
                     escalationChain.push(currentModel);
                     try {
-                        response = await makeProviderRequest(request, currentModel, config, currentTier);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
                         break;
                     } catch {
                         // Even original model failed - return error response
@@ -193,14 +195,17 @@ export async function executeRequest(
         // timeout.  If nothing arrives within 30 s we abort and try the tier's
         // fallback model (e.g. openrouter/google/gemini-2.5-flash) instead.
         if (response!.ok && response!.body) {
-            if (getProviderForModel(currentModel) === 'ollama') {
+            const currentProvider = modelCatalog
+                ? getProviderForModelFromCatalog(currentModel, modelCatalog)
+                : getProviderForModel(currentModel);
+            if (currentProvider === 'ollama') {
                 const peeked = await peekFirstOllamaChunk(response!.body, 15_000);
                 if (peeked === null) {
                     // No bytes in 15 s — attempt the tier's fallback model.
                     console.log(`[stream] Ollama first-token timeout (15s) for ${currentModel} — escalating`);
                     const escalation =
                         config.escalation.enabled && canEscalate(currentTier, config)
-                            ? getEscalatedModel(currentTier, config)
+                            ? getEscalatedModel(currentTier, config, modelCatalog)
                             : null;
                     if (escalation) {
                         console.log(`[stream] Escalating to ${escalation.model} (tier: ${escalation.tier})`);
@@ -211,7 +216,7 @@ export async function executeRequest(
                         escalated = true;
                         try {
                             response = await makeProviderRequest(
-                                request, currentModel, config, currentTier,
+                                request, currentModel, config, currentTier, modelCatalog,
                             );
                         } catch (err) {
                             response = createErrorResponse(
@@ -261,11 +266,14 @@ export async function executeRequest(
                 outputTokens,
                 hadToolCalls,
                 startTime,
-                config
+                config,
+                modelCatalog
             );
 
             // Start piping in the background
-            const provider = getProviderForModel(currentModel);
+            const provider = modelCatalog
+                ? getProviderForModelFromCatalog(currentModel, modelCatalog)
+                : getProviderForModel(currentModel);
             (provider === 'ollama'
                 ? pipeOllamaStream(response!, writer, currentModel)
                 : pipeStream(response!, writer)
@@ -285,8 +293,12 @@ export async function executeRequest(
                 execResult.hadToolCalls = hadToolCalls;
                 
                 const comparisonModel = config.baselineModel || routingDecision.originalModel;
-                execResult.originalCostUsd = calculateCost(comparisonModel, inputTokens, outputTokens);
-                execResult.actualCostUsd = calculateCost(currentModel, inputTokens, outputTokens);
+                execResult.originalCostUsd = modelCatalog
+                    ? calculateCostFromCatalog(comparisonModel, inputTokens, outputTokens, modelCatalog)
+                    : calculateCost(comparisonModel, inputTokens, outputTokens);
+                execResult.actualCostUsd = modelCatalog
+                    ? calculateCostFromCatalog(currentModel, inputTokens, outputTokens, modelCatalog)
+                    : calculateCost(currentModel, inputTokens, outputTokens);
                 execResult.savingsUsd = Math.max(0, execResult.originalCostUsd - execResult.actualCostUsd);
                 execResult.logWhenDone?.();
             });
@@ -318,7 +330,8 @@ export async function executeRequest(
             outputTokens,
             hadToolCalls,
             startTime,
-            config
+            config,
+            modelCatalog
         );
     } else {
         // NON-STREAMING REQUEST
@@ -331,14 +344,16 @@ export async function executeRequest(
 
         while (retryCount <= maxRetries) {
             try {
-                response = await makeProviderRequest(request, currentModel, config, currentTier);
+                response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
 
                 // Parse response body for validation
                 if (response.ok) {
                     let bodyText = await response.text();
 
                     // Adapt Ollama native response to OpenAI format
-                    const currentProvider = getProviderForModel(currentModel);
+                    const currentProvider = modelCatalog
+                        ? getProviderForModelFromCatalog(currentModel, modelCatalog)
+                        : getProviderForModel(currentModel);
                     if (currentProvider === 'ollama') {
                         bodyText = adaptOllamaResponse(bodyText, currentModel);
                     }
@@ -371,7 +386,7 @@ export async function executeRequest(
                         }
 
                         if (config.escalation.enabled && retryCount < maxRetries) {
-                            const escalation = getEscalatedModel(currentTier, config);
+                            const escalation = getEscalatedModel(currentTier, config, modelCatalog);
                             if (escalation) {
                                 await sleep(config.escalation.retryDelayMs);
                                 currentModel = escalation.model;
@@ -392,7 +407,7 @@ export async function executeRequest(
                         retryCount < maxRetries &&
                         routingDecision.safeToRetry
                     ) {
-                        const escalation = getEscalatedModel(currentTier, config);
+                        const escalation = getEscalatedModel(currentTier, config, modelCatalog);
                         if (escalation) {
                             await sleep(config.escalation.retryDelayMs);
                             currentModel = escalation.model;
@@ -408,7 +423,7 @@ export async function executeRequest(
                     if (config.escalation.alwaysFallbackToOriginal && currentModel !== routingDecision.originalModel) {
                         currentModel = routingDecision.originalModel;
                         escalationChain.push(currentModel);
-                        response = await makeProviderRequest(request, currentModel, config, currentTier);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
                     }
                     break;
                 }
@@ -420,7 +435,7 @@ export async function executeRequest(
                     retryCount < maxRetries &&
                     routingDecision.safeToRetry
                 ) {
-                    const escalation = getEscalatedModel(currentTier, config);
+                    const escalation = getEscalatedModel(currentTier, config, modelCatalog);
                     if (escalation) {
                         console.log(`[non-stream] Escalating to ${escalation.model} (tier: ${escalation.tier})`);
                         await sleep(config.escalation.retryDelayMs);
@@ -438,7 +453,7 @@ export async function executeRequest(
                     currentModel = routingDecision.originalModel;
                     escalationChain.push(currentModel);
                     try {
-                        response = await makeProviderRequest(request, currentModel, config, currentTier);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
                         break;
                     } catch {
                         response = createErrorResponse('All models failed');
@@ -488,7 +503,8 @@ export async function executeRequest(
             outputTokens,
             hadToolCalls,
             startTime,
-            config
+            config,
+            modelCatalog
         );
     }
 }
@@ -500,9 +516,12 @@ async function makeProviderRequest(
     request: ChatCompletionRequest,
     modelId: string,
     config: ClawRouteConfig,
-    tier?: TaskTier
+    tier?: TaskTier,
+    modelCatalog?: ModelEntry[]
 ): Promise<Response> {
-    const provider = getProviderForModel(modelId);
+    const provider = modelCatalog
+        ? getProviderForModelFromCatalog(modelId, modelCatalog)
+        : getProviderForModel(modelId);
 
     // Codex uses a different protocol (Responses API via chatgpt.com) — delegate entirely.
     // The codex-transport handles its own auth (OAuth), request/response translation,
@@ -767,17 +786,18 @@ function buildExecutionResult(
     outputTokens: number,
     hadToolCalls: boolean,
     startTime: number,
-    config: ClawRouteConfig
+    config: ClawRouteConfig,
+    modelCatalog?: ModelEntry[]
 ): ExecutionResult {
     const responseTimeMs = Date.now() - startTime;
 
     const comparisonModel = config.baselineModel || routingDecision.originalModel;
-    const originalCostUsd = calculateCost(
-        comparisonModel,
-        inputTokens,
-        outputTokens
-    );
-    const actualCostUsd = calculateCost(actualModel, inputTokens, outputTokens);
+    const originalCostUsd = modelCatalog
+        ? calculateCostFromCatalog(comparisonModel, inputTokens, outputTokens, modelCatalog)
+        : calculateCost(comparisonModel, inputTokens, outputTokens);
+    const actualCostUsd = modelCatalog
+        ? calculateCostFromCatalog(actualModel, inputTokens, outputTokens, modelCatalog)
+        : calculateCost(actualModel, inputTokens, outputTokens);
     const savingsUsd = Math.max(0, originalCostUsd - actualCostUsd);
 
     return {
@@ -801,9 +821,12 @@ function buildExecutionResult(
  */
 export async function executePassthrough(
     request: ChatCompletionRequest,
-    config: ClawRouteConfig
+    config: ClawRouteConfig,
+    modelCatalog?: ModelEntry[]
 ): Promise<Response> {
-    const provider = getProviderForModel(request.model);
+    const provider = modelCatalog
+        ? getProviderForModelFromCatalog(request.model, modelCatalog)
+        : getProviderForModel(request.model);
     const apiKey = getApiKey(config, provider);
 
     if (!apiKey) {
@@ -811,7 +834,7 @@ export async function executePassthrough(
     }
 
     try {
-        return await makeProviderRequest(request, request.model, config);
+        return await makeProviderRequest(request, request.model, config, undefined, modelCatalog);
     } catch (error) {
         return createErrorResponse(error instanceof Error ? error.message : 'Passthrough failed');
     }
