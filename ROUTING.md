@@ -139,14 +139,14 @@ The Codex provider profile defaults are now:
 |---|---|---|
 | `heartbeat` | `codex/gpt-5.4-mini` | `codex/gpt-5.4-mini` |
 | `simple` | `codex/gpt-5.4-mini` | `codex/gpt-5.4-mini` |
-| `moderate` | `codex/gpt-5.4` | `codex/gpt-5.4-mini` |
-| `complex` | `codex/gpt-5.4` | `codex/gpt-5.4-mini` |
-| `frontier-sonnet` | `codex/gpt-5.4` | `codex/gpt-5.4-mini` |
-| `frontier-opus` | `codex/gpt-5.4` | `codex/gpt-5.4-mini` |
+| `moderate` | `codex/gpt-5.5` | `codex/gpt-5.4` |
+| `complex` | `codex/gpt-5.5` | `codex/gpt-5.4` |
+| `frontier-sonnet` | `codex/gpt-5.5` | `codex/gpt-5.4` |
+| `frontier-opus` | `codex/gpt-5.5` | `codex/gpt-5.4` |
 
 The default context overrides pin `codex/gpt-5.5` and `codex/gpt-5.4` to 1,050,000 tokens and `codex/gpt-5.4-mini` to 400,000.
 
-`codex/gpt-5.5` remains enabled in the catalog and available through `/v1/models` for explicit client-side selection.
+`codex/gpt-5.5` remains enabled in the catalog, is the bundled baseline model for the Codex profile, and is available through `/v1/models` for explicit client-side selection.
 
 ## Admin Model Management
 

@@ -31,14 +31,14 @@ describe('Codex model metadata', () => {
         });
 
         expect(snapshot.providerProfile).toBe('codex');
-        expect(snapshot.baselineModel).toBe('codex/gpt-5.4');
+        expect(snapshot.baselineModel).toBe('codex/gpt-5.5');
         expect(snapshot.models[TaskTier.MODERATE]).toEqual({
-            primary: 'codex/gpt-5.4',
-            fallback: 'codex/gpt-5.4-mini',
+            primary: 'codex/gpt-5.5',
+            fallback: 'codex/gpt-5.4',
         });
         expect(snapshot.models[TaskTier.COMPLEX]).toEqual({
-            primary: 'codex/gpt-5.4',
-            fallback: 'codex/gpt-5.4-mini',
+            primary: 'codex/gpt-5.5',
+            fallback: 'codex/gpt-5.4',
         });
         expect(snapshot.modelCatalog.some((model) => model.id === 'codex/gpt-5.5' && model.enabled)).toBe(true);
     });
