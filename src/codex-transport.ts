@@ -46,6 +46,11 @@ interface CodexAuthSlot {
     rateLimitedUntil: number; // epoch ms — skip this slot until then
 }
 
+interface CodexErrorContext {
+    slot?: number;
+    path?: string;
+}
+
 // ── Rotation State ─────────────────────────────────────────────────
 let authSlots: CodexAuthSlot[] = [];
 let currentSlotIndex = 0;
@@ -683,6 +688,99 @@ function mapFinishReason(responseStatus: string | undefined): string {
     }
 }
 
+function asNonEmptyString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function asErrorCode(value: unknown): string | undefined {
+    if (typeof value === 'string' && value.length > 0) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return undefined;
+}
+
+function getErrorRecord(value: unknown): Record<string, unknown> | null {
+    return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
+}
+
+function getCodexErrorSlot(errorRecord: Record<string, unknown> | null, errorContext?: CodexErrorContext): number | undefined {
+    const slot = errorRecord?.['slot'];
+    if (typeof slot === 'number' && Number.isInteger(slot) && slot >= 0) {
+        return slot;
+    }
+    return errorContext?.slot;
+}
+
+function formatCodexErrorMessage(
+    message: string,
+    code: string | undefined,
+    slot: number | undefined,
+): string {
+    const parts: string[] = [];
+    if (slot !== undefined) {
+        parts.push(`slot:${slot}`);
+    }
+    if (code) {
+        parts.push(`code:${code}`);
+    }
+    return parts.length > 0 ? `${message} [${parts.join(' ')}]` : message;
+}
+
+function buildCodexErrorPayload(
+    errorValue: unknown,
+    fallbackMessage: string,
+    fallbackCode: string,
+    fallbackType: string,
+    errorContext?: CodexErrorContext,
+): Record<string, unknown> {
+    const errorRecord = getErrorRecord(errorValue);
+    const code = asErrorCode(errorRecord?.['code']) ?? fallbackCode;
+    const type = asNonEmptyString(errorRecord?.['type']) ?? fallbackType;
+    const stack = asNonEmptyString(errorRecord?.['stack']);
+    const slot = getCodexErrorSlot(errorRecord, errorContext);
+    const baseMessage = typeof errorValue === 'string'
+        ? errorValue
+        : asNonEmptyString(errorRecord?.['message']) ?? fallbackMessage;
+
+    const error: Record<string, unknown> = {
+        message: formatCodexErrorMessage(baseMessage, code, slot),
+        type,
+        code,
+    };
+    if (stack) {
+        error['stack'] = stack;
+    }
+    if (slot !== undefined) {
+        error['slot'] = slot;
+    }
+    return error;
+}
+
+function getCodexErrorResponseRecord(body: string): Record<string, unknown> | null {
+    try {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        return getErrorRecord(parsed['error']);
+    } catch {
+        return null;
+    }
+}
+
+function getCodexResponseStatus(body: string): number {
+    const error = getCodexErrorResponseRecord(body);
+    if (!error) {
+        return 200;
+    }
+
+    const code = asErrorCode(error['code']);
+    const type = asNonEmptyString(error['type']);
+    if (type === 'auth_error' || code === 'invalid_api_key' || code === 'unauthorized') {
+        return 401;
+    }
+    if (type === 'rate_limit_error' || type === 'usage_limit_reached' || code === 'rate_limit_exceeded' || code === 'usage_limit_reached' || code === 'codex_429') {
+        return 429;
+    }
+    return 502;
+}
+
 /**
  * Transform a Codex Responses API SSE stream into an OpenAI Chat Completions SSE stream.
  *
@@ -696,6 +794,7 @@ export function codexResponseToStream(
     upstreamBody: ReadableStream<Uint8Array>,
     model: string,
     wantsStream: boolean,
+    errorContext: CodexErrorContext = {},
 ): ReadableStream<Uint8Array> {
     const encoder = new TextEncoder();
     const chatId = `chatcmpl_${crypto.randomUUID()}`;
@@ -720,6 +819,7 @@ export function codexResponseToStream(
     const itemsWithDoneText = new Set<string>();
     const toolCallsWithArgumentDelta = new Set<string>();
     let collectedReasoning = '';
+    let terminalErrorPayload: Record<string, unknown> | null = null;
     const reasoningPartKeysWithDelta = new Set<string>();
     const reasoningPartKeysWithDone = new Set<string>();
     const reasoningItemsWithEvents = new Set<string>();
@@ -1277,14 +1377,22 @@ export function codexResponseToStream(
                         }
 
                         case 'error': {
-                            const msg = parsed['message'] as string ?? 'Codex upstream error';
+                            const err = parsed['error'] ?? parsed; // allow both { error: ... } and flat
+                            const errorPayload = buildCodexErrorPayload(
+                                err,
+                                'Codex upstream error',
+                                'codex_error',
+                                'upstream_error',
+                                errorContext,
+                            );
+                            terminalErrorPayload = errorPayload;
                             if (wantsStream) {
                                 controller.enqueue(encoder.encode(
-                                    `data: ${JSON.stringify({
-                                        error: { message: msg, type: 'upstream_error', code: 'codex_error' },
-                                    })}\n\n`
+                                    `data: ${JSON.stringify({ error: errorPayload })}\n\n`
                                 ));
                                 controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                                controller.close();
+                                return;
                             }
                             break;
                         }
@@ -1296,6 +1404,12 @@ export function codexResponseToStream(
 
                 // For non-streaming: emit the full chat completion response
                 if (!wantsStream) {
+                    if (terminalErrorPayload) {
+                        controller.enqueue(encoder.encode(JSON.stringify({ error: terminalErrorPayload })));
+                        controller.close();
+                        return;
+                    }
+
                     const message: Record<string, unknown> = {
                         role: 'assistant',
                         content: collectedText.length > 0 ? collectedText : null,
@@ -1352,7 +1466,7 @@ function parseCodexError(errorBody: string): Record<string, unknown> | null {
 /**
  * Normalize upstream Codex errors into the existing ClawRoute envelope.
  */
-function buildCodexErrorBody(status: number, errorBody: string): string {
+function buildCodexErrorBody(status: number, errorBody: string, errorContext: CodexErrorContext = {}): string {
     const parsedError = parseCodexError(errorBody);
     const upstreamMessage = typeof parsedError?.['message'] === 'string'
         ? parsedError['message']
@@ -1360,14 +1474,18 @@ function buildCodexErrorBody(status: number, errorBody: string): string {
     const message = upstreamMessage
         ? `Codex API error (${status}): ${upstreamMessage}`
         : `Codex API error (${status})`;
-    const error: Record<string, unknown> = {
+    const error = buildCodexErrorPayload(
+        parsedError ?? undefined,
         message,
-        type: 'upstream_error',
-        code: `codex_${status}`,
-    };
-    if (typeof parsedError?.['type'] === 'string') {
-        error['upstream_type'] = parsedError['type'];
-    }
+        `codex_${status}`,
+        'upstream_error',
+        errorContext,
+    );
+    error['message'] = formatCodexErrorMessage(
+        message,
+        asNonEmptyString(error['code']),
+        typeof error['slot'] === 'number' ? error['slot'] : undefined,
+    );
     if (typeof parsedError?.['resets_at'] === 'number') {
         error['resets_at'] = parsedError['resets_at'];
     }
@@ -1433,6 +1551,7 @@ async function executeCodexCall(
     modelName: string,
     wantsStream: boolean,
     proxyAgent: ProxyAgent | null,
+    errorContext: CodexErrorContext = {},
 ): Promise<Response> {
     const url = `${CODEX_BASE_URL}/responses`;
     const headers: Record<string, string> = {
@@ -1459,7 +1578,7 @@ async function executeCodexCall(
         if (!upstream.ok) {
             const errorBody = await upstream.text();
             return new Response(
-                buildCodexErrorBody(upstream.status, errorBody),
+                buildCodexErrorBody(upstream.status, errorBody, errorContext),
                 { status: upstream.status, headers: { 'Content-Type': 'application/json' } },
             );
         }
@@ -1471,7 +1590,7 @@ async function executeCodexCall(
             );
         }
 
-        const transformedBody = codexResponseToStream(upstream.body, modelName, wantsStream);
+        const transformedBody = codexResponseToStream(upstream.body, modelName, wantsStream, errorContext);
 
         if (wantsStream) {
             return new Response(transformedBody, {
@@ -1497,7 +1616,7 @@ async function executeCodexCall(
             );
 
             return new Response(jsonBody, {
-                status: 200,
+                status: getCodexResponseStatus(jsonBody),
                 headers: { 'Content-Type': 'application/json' },
             });
         }
@@ -1505,7 +1624,15 @@ async function executeCodexCall(
         clearTimeout(timeoutId);
         const message = err instanceof Error ? err.message : 'Codex request failed';
         return new Response(
-            JSON.stringify({ error: { message, type: 'server_error', code: 'codex_error' } }),
+            JSON.stringify({
+                error: buildCodexErrorPayload(
+                    message,
+                    'Codex request failed',
+                    'codex_error',
+                    'server_error',
+                    errorContext,
+                ),
+            }),
             { status: 502, headers: { 'Content-Type': 'application/json' } },
         );
     }
@@ -1575,7 +1702,17 @@ export async function makeCodexRequest(
         }
 
         const slotUsed = currentSlotIndex;
-        const response = await executeCodexCall(result.auth, body, modelName, wantsStream, proxyAgent);
+        const response = await executeCodexCall(
+            result.auth,
+            body,
+            modelName,
+            wantsStream,
+            proxyAgent,
+            {
+                slot: slotUsed,
+                path: result.auth.sourcePath ?? authSlots[slotUsed]?.path,
+            },
+        );
         releaseCodexAuth();
 
         // Success or non-retriable error → return immediately

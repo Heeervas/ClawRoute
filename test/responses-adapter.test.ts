@@ -71,6 +71,41 @@ describe('responsesInputToChatMessages', () => {
         expect(result).toEqual([{ role: 'assistant', content: 'hi' }]);
     });
 
+    it('should preserve reasoning items on assistant turns', () => {
+        const input = [
+            { role: 'user', content: 'Continue after inspecting the tool result.' },
+            {
+                type: 'reasoning',
+                id: 'rs_1',
+                summary: [{ type: 'summary_text', text: 'I should inspect the tool result first.' }],
+            },
+            {
+                type: 'function_call',
+                call_id: 'c1',
+                name: 'read_logs',
+                arguments: '{"service":"clawroute"}',
+            },
+        ];
+        const result = responsesInputToChatMessages(input);
+
+        expect(result).toEqual([
+            { role: 'user', content: 'Continue after inspecting the tool result.' },
+            {
+                role: 'assistant',
+                content: null,
+                reasoning_content: 'I should inspect the tool result first.',
+                reasoning_item_id: 'rs_1',
+                tool_calls: [
+                    {
+                        id: 'c1',
+                        type: 'function',
+                        function: { name: 'read_logs', arguments: '{"service":"clawroute"}' },
+                    },
+                ],
+            },
+        ]);
+    });
+
     it('should convert function_call to assistant message with tool_calls', () => {
         const input = [
             {
@@ -240,6 +275,33 @@ describe('responsesBodyToChatCompletions', () => {
                     },
                     strict: true,
                 },
+            },
+        ]);
+    });
+
+    it('should translate reasoning effort and reasoning items', () => {
+        const body = {
+            model: 'codex/gpt-5.4',
+            reasoning: { effort: 'high' },
+            input: [
+                { role: 'user', content: 'Continue the analysis.' },
+                {
+                    type: 'reasoning',
+                    id: 'rs_1',
+                    summary: [{ type: 'summary_text', text: 'Need to check the previous tool output.' }],
+                },
+            ],
+        };
+        const result = responsesBodyToChatCompletions(body);
+
+        expect(result.reasoning_effort).toBe('high');
+        expect(result.messages).toEqual([
+            { role: 'user', content: 'Continue the analysis.' },
+            {
+                role: 'assistant',
+                content: null,
+                reasoning_content: 'Need to check the previous tool output.',
+                reasoning_item_id: 'rs_1',
             },
         ]);
     });

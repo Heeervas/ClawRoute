@@ -7,6 +7,31 @@
 
 import type { ChatMessage, ChatCompletionRequest, ContentPart, ToolDefinition } from './types.js';
 
+type AssistantMessage = ChatMessage & Record<string, unknown>;
+
+function lastAssistantMessage(messages: ChatMessage[]): AssistantMessage | undefined {
+    const message = messages[messages.length - 1];
+    if (!message || message.role !== 'assistant') {
+        return undefined;
+    }
+    return message as AssistantMessage;
+}
+
+function extractReasoningText(item: Record<string, unknown>): string | undefined {
+    const parts = [item.summary, item.content]
+        .filter(Array.isArray)
+        .flatMap(section => section as Array<Record<string, unknown>>)
+        .map(part => {
+            if (part.type === 'summary_text' || part.type === 'reasoning_text') {
+                return typeof part.text === 'string' ? part.text : '';
+            }
+            return '';
+        })
+        .filter(Boolean);
+
+    return parts.length > 0 ? parts.join('') : undefined;
+}
+
 /**
  * Convert Responses API input items to Chat Completions messages.
  *
@@ -49,10 +74,36 @@ export function responsesInputToChatMessages(input: unknown[]): ChatMessage[] {
             continue;
         }
 
+        if (obj.type === 'reasoning') {
+            const reasoningContent = extractReasoningText(obj);
+            if (!reasoningContent) {
+                continue;
+            }
+
+            messages.push({
+                role: 'assistant',
+                content: null,
+                reasoning_content: reasoningContent,
+                reasoning_item_id: obj.id as string | undefined,
+            } as ChatMessage);
+            continue;
+        }
+
         // assistant message with output_text
         if (obj.type === 'message' && obj.role === 'assistant') {
             const contentArr = obj.content as Array<Record<string, unknown>>;
             const textPart = contentArr?.find((p) => p.type === 'output_text');
+
+            const previousAssistant = lastAssistantMessage(messages);
+            if (
+                previousAssistant &&
+                previousAssistant.content === null &&
+                typeof previousAssistant.reasoning_content === 'string'
+            ) {
+                previousAssistant.content = (textPart?.text as string) ?? null;
+                continue;
+            }
+
             messages.push({
                 role: 'assistant',
                 content: (textPart?.text as string) ?? null,
@@ -72,9 +123,15 @@ export function responsesInputToChatMessages(input: unknown[]): ChatMessage[] {
             };
 
             // Merge into previous assistant message if it has tool_calls
-            const prev = messages[messages.length - 1];
-            if (prev && prev.role === 'assistant' && prev.tool_calls) {
-                prev.tool_calls.push(toolCall);
+            const previousAssistant = lastAssistantMessage(messages);
+            if (previousAssistant?.tool_calls) {
+                previousAssistant.tool_calls.push(toolCall);
+            } else if (
+                previousAssistant &&
+                previousAssistant.content === null &&
+                typeof previousAssistant.reasoning_content === 'string'
+            ) {
+                previousAssistant.tool_calls = [toolCall];
             } else {
                 messages.push({
                     role: 'assistant',
@@ -122,6 +179,11 @@ export function responsesBodyToChatCompletions(
     if (body.max_output_tokens !== undefined) ccRequest.max_tokens = body.max_output_tokens as number;
     if (body.top_p !== undefined) ccRequest.top_p = body.top_p as number;
     if (body.stream !== undefined) ccRequest.stream = body.stream as boolean;
+
+    const reasoning = body.reasoning as Record<string, unknown> | undefined;
+    if (typeof reasoning?.effort === 'string') {
+        ccRequest.reasoning_effort = reasoning.effort;
+    }
 
     // Tools: flat Responses format → nested CC format
     if (Array.isArray(body.tools)) {

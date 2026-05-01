@@ -159,6 +159,10 @@ ClawRoute uses heuristic rules evaluated in priority order (<5ms, fully local):
 - **Passthrough on error**: Any ClawRoute error → transparent passthrough to original model.
 - **Kill switch**: `POST /api/disable` or `CLAWROUTE_ENABLED=false` immediately stops all routing.
 
+### Error Forwarding Policy (Codex)
+
+When relaying upstream Codex errors, ClawRoute only forwards a strict set of whitelisted fields: `message`, `code`, `type`, `stack`, and `slot` (if present). This preserves the useful rotation context without leaking local auth file paths or other internal data. All other fields are omitted. Legacy error compatibility is preserved for clients expecting previous formats.
+
 ### 100% Local & Private
 
 - Classification runs 100% locally (no API calls)
