@@ -15,6 +15,7 @@ import {
     RoutingDecision,
     ClassificationResult,
     ModelEntry,
+    RequestExecutionContext,
     TaskTier,
 } from './types.js';
 import { calculateCost, calculateCostFromCatalog, getApiBaseUrl, getAuthHeader, getProviderForModel, getProviderForModelFromCatalog } from './models.js';
@@ -23,19 +24,8 @@ import { getEscalatedModel } from './router.js';
 import { validateResponse } from './validator.js';
 import { pipeStream, pipeOllamaStream, adaptOllamaResponse, getSSEHeaders, StreamResult } from './streaming.js';
 import { makeCodexRequest } from './codex-transport.js';
-import { ProxyAgent } from 'undici';
-
-// Lazily-created proxy agent for external LLM API calls.
-// Node 20's native fetch (undici) does NOT read http_proxy/https_proxy env vars
-// automatically — we must pass a ProxyAgent explicitly for external providers.
-const _httpsProxy = process.env.HTTPS_PROXY ?? process.env.https_proxy;
-let _proxyAgent: ProxyAgent | null = null;
-function getProxyAgent(): ProxyAgent | null {
-    if (!_httpsProxy) return null;
-    if (!_proxyAgent) _proxyAgent = new ProxyAgent(_httpsProxy);
-    return _proxyAgent;
-}
 import { sleep, estimateMessagesTokens, safeJsonParse } from './utils.js';
+import { getProxyAgent } from './http-proxy.js';
 
 /**
  * Check if escalation is allowed based on plan and tier.
@@ -64,7 +54,8 @@ export async function executeRequest(
     routingDecision: RoutingDecision,
     _classification: ClassificationResult,
     config: ClawRouteConfig,
-    modelCatalog?: ModelEntry[]
+    modelCatalog?: ModelEntry[],
+    executionContext: RequestExecutionContext = { sessionId: null },
 ): Promise<ExecutionResult> {
     const startTime = Date.now();
 
@@ -108,7 +99,7 @@ export async function executeRequest(
         while (retryCount <= maxRetries) {
             try {
                 // Make the request to the current model
-                response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
+                response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog, executionContext);
 
                 // Check if we got an error BEFORE streaming starts
                 if (!response.ok) {
@@ -137,7 +128,7 @@ export async function executeRequest(
                     if (config.escalation.alwaysFallbackToOriginal && currentModel !== routingDecision.originalModel) {
                         currentModel = routingDecision.originalModel;
                         escalationChain.push(currentModel);
-                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog, executionContext);
                     }
                 }
 
@@ -168,7 +159,7 @@ export async function executeRequest(
                     currentModel = routingDecision.originalModel;
                     escalationChain.push(currentModel);
                     try {
-                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog, executionContext);
                         break;
                     } catch {
                         // Even original model failed - return error response
@@ -216,7 +207,7 @@ export async function executeRequest(
                         escalated = true;
                         try {
                             response = await makeProviderRequest(
-                                request, currentModel, config, currentTier, modelCatalog,
+                                request, currentModel, config, currentTier, modelCatalog, executionContext,
                             );
                         } catch (err) {
                             response = createErrorResponse(
@@ -344,7 +335,7 @@ export async function executeRequest(
 
         while (retryCount <= maxRetries) {
             try {
-                response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
+                response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog, executionContext);
 
                 // Parse response body for validation
                 if (response.ok) {
@@ -423,7 +414,7 @@ export async function executeRequest(
                     if (config.escalation.alwaysFallbackToOriginal && currentModel !== routingDecision.originalModel) {
                         currentModel = routingDecision.originalModel;
                         escalationChain.push(currentModel);
-                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog, executionContext);
                     }
                     break;
                 }
@@ -453,7 +444,7 @@ export async function executeRequest(
                     currentModel = routingDecision.originalModel;
                     escalationChain.push(currentModel);
                     try {
-                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog);
+                        response = await makeProviderRequest(request, currentModel, config, currentTier, modelCatalog, executionContext);
                         break;
                     } catch {
                         response = createErrorResponse('All models failed');
@@ -517,7 +508,8 @@ async function makeProviderRequest(
     modelId: string,
     config: ClawRouteConfig,
     tier?: TaskTier,
-    modelCatalog?: ModelEntry[]
+    modelCatalog?: ModelEntry[],
+    executionContext: RequestExecutionContext = { sessionId: null },
 ): Promise<Response> {
     const provider = modelCatalog
         ? getProviderForModelFromCatalog(modelId, modelCatalog)
@@ -528,7 +520,7 @@ async function makeProviderRequest(
     // and returns a standard Chat Completions Response so the rest of the pipeline works.
     if (provider === 'codex') {
         const proxyAgent = getProxyAgent();
-        return makeCodexRequest(request as Record<string, unknown>, modelId, proxyAgent);
+        return makeCodexRequest(request as Record<string, unknown>, modelId, proxyAgent, executionContext);
     }
 
     const apiKey = getApiKey(config, provider);

@@ -135,6 +135,20 @@ describe('Model Endpoints', () => {
             });
         });
 
+        it('should expose bundled openai/gpt-image-2 with image-safe capabilities', async () => {
+            const res = await app.request('/v1/models');
+            const body = await res.json();
+
+            const model = body.data.find((entry: { id: string }) => entry.id === 'openai/gpt-image-2');
+
+            expect(model).toMatchObject({
+                id: 'openai/gpt-image-2',
+                owned_by: 'openai',
+                tool_capable: false,
+                multimodal: true,
+            });
+        });
+
         it('should only return enabled models', async () => {
             // Register a disabled model
             registerModel({

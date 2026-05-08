@@ -59,6 +59,7 @@
     .card-label { font-size: 12px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; margin-bottom: 8px; }
     .card-value { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
     .card-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .card-link { display: inline-block; margin-top: 12px; font-size: 13px; font-weight: 600; color: var(--blue); }
     .savings-value { color: var(--green); }
 
     .section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
@@ -131,6 +132,12 @@
         <p id="stat-plan" class="card-value">-</p>
         <p id="stat-billing-sub" class="card-sub">Loading...</p>
       </div>
+      <div class="card">
+        <p class="card-label">Operator</p>
+        <p class="card-value">Codex</p>
+        <p class="card-sub">Open the per-account 5h and Weekly quota dashboard.</p>
+        <a id="codex-usage-link" class="card-link" href="/dashboard-codex">Open usage dashboard</a>
+      </div>
     </div>
 
     <div class="section">
@@ -168,6 +175,7 @@
   <script>
     const BASE = location.pathname.startsWith('/clawroute') ? '/clawroute' : '';
     if (BASE) document.getElementById('portal-nav').style.display = 'block';
+    document.getElementById('codex-usage-link').href = `${BASE}/dashboard-codex`;
 
     const state = {
       lastUpdate: 0,

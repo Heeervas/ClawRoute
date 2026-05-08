@@ -13,6 +13,7 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, renameS
 import { join, dirname, resolve } from 'path';
 import {
     ClawRouteConfig,
+    CodexUsageSnapshotRecord,
     LogEntry,
     RecentDecision,
     TaskTier,
@@ -56,6 +57,24 @@ const ROUTING_LOG_INDEX = `
     ON routing_log (timestamp)
 `;
 
+const CODEX_USAGE_SCHEMA = `
+    CREATE TABLE IF NOT EXISTS codex_usage_snapshots (
+        account_key TEXT NOT NULL,
+        slot_index INTEGER NOT NULL,
+        window TEXT NOT NULL,
+        used_percent REAL NOT NULL,
+        reset_at TEXT NOT NULL,
+        window_minutes INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_key, window)
+    )
+`;
+
+const CODEX_USAGE_INDEX = `
+    CREATE INDEX IF NOT EXISTS idx_codex_usage_slot_index
+    ON codex_usage_snapshots (slot_index)
+`;
+
 const OPTIONAL_COLUMNS = [
     'prompt_preview TEXT',
     'context_info TEXT',
@@ -65,6 +84,7 @@ type SqlJsModule = Awaited<ReturnType<typeof initSqlJs>>;
 
 function initializeSchema(database: Database): void {
     database.run(ROUTING_LOG_SCHEMA);
+    database.run(CODEX_USAGE_SCHEMA);
 
     for (const colDef of OPTIONAL_COLUMNS) {
         try {
@@ -75,6 +95,7 @@ function initializeSchema(database: Database): void {
     }
 
     database.run(ROUTING_LOG_INDEX);
+    database.run(CODEX_USAGE_INDEX);
 }
 
 function recoverCorruptDatabase(SQL: SqlJsModule, error: unknown): Database {
@@ -285,6 +306,77 @@ export function getRecentDecisions(limit: number = 50): RecentDecision[] {
     } catch (error) {
         console.warn('Failed to get recent decisions:', error);
         return [];
+    }
+}
+
+export function getCodexUsageSnapshots(): CodexUsageSnapshotRecord[] {
+    if (!db) return [];
+
+    try {
+        const stmt = db.prepare(
+            `SELECT account_key, slot_index, window, used_percent, reset_at, window_minutes, updated_at
+             FROM codex_usage_snapshots
+             ORDER BY updated_at DESC`
+        );
+        const snapshots: CodexUsageSnapshotRecord[] = [];
+
+        while (stmt.step()) {
+            const row = stmt.getAsObject() as Record<string, unknown>;
+            snapshots.push({
+                accountKey: row['account_key'] as string,
+                slotIndex: Number(row['slot_index']),
+                window: row['window'] as CodexUsageSnapshotRecord['window'],
+                usedPercent: Number(row['used_percent']),
+                resetAt: row['reset_at'] as string,
+                windowMinutes: Number(row['window_minutes']),
+                updatedAt: row['updated_at'] as string,
+            });
+        }
+
+        stmt.free();
+        return snapshots;
+    } catch (error) {
+        console.warn('Failed to load Codex usage snapshots:', error);
+        return [];
+    }
+}
+
+export function upsertCodexUsageSnapshots(records: CodexUsageSnapshotRecord[]): void {
+    if (!db || records.length === 0) return;
+
+    try {
+        db.run('BEGIN');
+        for (const record of records) {
+            db.run(
+                `INSERT INTO codex_usage_snapshots (
+                    account_key, slot_index, window, used_percent, reset_at, window_minutes, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_key, window) DO UPDATE SET
+                    slot_index = excluded.slot_index,
+                    used_percent = excluded.used_percent,
+                    reset_at = excluded.reset_at,
+                    window_minutes = excluded.window_minutes,
+                    updated_at = excluded.updated_at`,
+                [
+                    record.accountKey,
+                    record.slotIndex,
+                    record.window,
+                    record.usedPercent,
+                    record.resetAt,
+                    record.windowMinutes,
+                    record.updatedAt,
+                ]
+            );
+        }
+        db.run('COMMIT');
+        persistDb();
+    } catch (error) {
+        try {
+            db.run('ROLLBACK');
+        } catch {
+            // Best effort cleanup.
+        }
+        console.warn('Failed to persist Codex usage snapshots:', error);
     }
 }
 

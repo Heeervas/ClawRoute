@@ -442,13 +442,20 @@ function loadAlertsConfig(): AlertsConfig {
     };
 }
 
+function resolveCodexAuthFile(pathOrHome: string | undefined): string {
+    const candidate = pathOrHome?.trim() ?? '';
+    if (!candidate) return '';
+    return candidate.endsWith('.json') ? candidate : join(candidate, 'auth.json');
+}
+
 /**
  * Load the Codex OAuth token.
  *
  * Priority:
  * 1. OPENAI_CODEX_TOKEN env var (explicit sess- token)
- * 2. OPENAI_CODEX_AUTH_PATH env var (path to a codex auth.json)
- * 3. Default path: ~/.codex/auth.json (written by `codex login`)
+ * 2. First OPENAI_CODEX_AUTH_PATHS entry (auth.json path or CODEX_HOME dir)
+ * 3. OPENAI_CODEX_AUTH_PATH env var (auth.json path or CODEX_HOME dir)
+ * 4. CODEX_HOME/auth.json or ~/.codex/auth.json
  *
  * @returns The Codex bearer token or empty string
  */
@@ -459,8 +466,12 @@ function loadCodexToken(): string {
     try {
         const multiPaths = process.env['OPENAI_CODEX_AUTH_PATHS'];
         const authPath = multiPaths
-            ? multiPaths.split(',')[0]?.trim() ?? ''
-            : (process.env['OPENAI_CODEX_AUTH_PATH'] || join(homedir(), '.codex', 'auth.json'));
+            ? resolveCodexAuthFile(multiPaths.split(',')[0])
+            : resolveCodexAuthFile(
+                process.env['OPENAI_CODEX_AUTH_PATH']
+                    || process.env['CODEX_HOME']
+                    || join(homedir(), '.codex')
+            );
         if (existsSync(authPath)) {
             const content = readFileSync(authPath, 'utf-8');
             const auth = JSON.parse(content) as Record<string, unknown>;

@@ -13,19 +13,27 @@
  * Reference: https://github.com/EvanZhouDev/openai-oauth
  */
 
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { ProxyAgent } from 'undici';
+import { CodexSessionAccountAffinity, RequestExecutionContext } from './types.js';
 
 // ── Types ──────────────────────────────────────────────────────────
 
-interface CodexAuth {
+export interface CodexAuth {
     accessToken: string;
     accountId: string;
     refreshToken?: string;
     idToken?: string;
     sourcePath?: string;
+}
+
+export interface CodexAuthSlotSnapshot {
+    slotIndex: number;
+    path: string | null;
+    rateLimitedUntil: number;
 }
 
 interface ChatMessage {
@@ -51,12 +59,23 @@ interface CodexErrorContext {
     path?: string;
 }
 
+type BalanceLoaderMode = 'off' | 'shadow' | 'on';
+type CodexSelectionLease = {
+    accountKey: string | null;
+    slotIndex: number;
+    selectedAt: number;
+};
+
 // ── Rotation State ─────────────────────────────────────────────────
 let authSlots: CodexAuthSlot[] = [];
 let currentSlotIndex = 0;
 let lastRotationTime = 0;
 let lastQueryEndTime = 0;
 let activeRequests = 0;
+const sessionAffinities = new Map<string, CodexSessionAccountAffinity>();
+const pendingLeasesByAccountKey = new Map<string, number>();
+const pendingLeasesBySlotIndex = new Map<number, number>();
+const slotLastSelectedAtByIndex = new Map<number, number>();
 
 // Configurable via env vars (read once on first use)
 let rotationIntervalMs = -1;  // -1 = not yet loaded
@@ -78,12 +97,181 @@ function getRotationIdleMs(): number {
     return rotationIdleMs;
 }
 
+function getBalanceLoaderMode(): BalanceLoaderMode {
+    const configured = (process.env['CODEX_BALANCE_LOADER_MODE'] ?? 'off').trim().toLowerCase();
+    if (configured === 'on' || configured === 'shadow') return configured;
+    return 'off';
+}
+
 // ── Constants ──────────────────────────────────────────────────────
 
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const REFRESH_MARGIN_MS = 5 * 60 * 1000; // 5 minutes before expiry
+
+function resolveAuthPathEntry(pathOrHome: string | undefined): string {
+    const candidate = pathOrHome?.trim() ?? '';
+    if (!candidate) return '';
+    return candidate.endsWith('.json') ? candidate : join(candidate, 'auth.json');
+}
+
+function hashAccountKey(accountId: string): string {
+    return createHash('sha256').update(accountId).digest('hex').slice(0, 16);
+}
+
+function extractSessionIdFromRequest(request: Record<string, unknown>): string | null {
+    const messages = Array.isArray(request['messages']) ? request['messages'] as Array<Record<string, unknown>> : [];
+    const systemMessage = messages.find((message) => message['role'] === 'system');
+    const systemContent = typeof systemMessage?.['content'] === 'string' ? systemMessage['content'] : '';
+    const senderMatch = systemContent.match(/"sender_id"\s*:\s*"(\d+)"/);
+    const senderId = senderMatch?.[1];
+    return senderId ? createHash('sha256').update(senderId).digest('hex').slice(0, 8) : null;
+}
+
+function getSlotAccountId(slot: CodexAuthSlot): string | null {
+    if (slot.auth?.accountId) return slot.auth.accountId;
+    const authData = readAuthFile(slot.path);
+    if (!authData) return null;
+    const tokens = authData['tokens'] as Record<string, unknown> | undefined;
+    const explicitAccountId = tokens?.['account_id'];
+    if (typeof explicitAccountId === 'string' && explicitAccountId.length > 0) return explicitAccountId;
+    const idToken = typeof tokens?.['id_token'] === 'string' ? tokens['id_token'] : undefined;
+    return deriveAccountId(idToken) ?? null;
+}
+
+function getSlotAccountKey(slot: CodexAuthSlot): string | null {
+    const accountId = getSlotAccountId(slot);
+    return accountId ? hashAccountKey(accountId) : null;
+}
+
+function incrementLeaseCounter(map: Map<string | number, number>, key: string | number): void {
+    map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+function decrementLeaseCounter(map: Map<string | number, number>, key: string | number): void {
+    const next = (map.get(key) ?? 0) - 1;
+    if (next > 0) {
+        map.set(key, next);
+    } else {
+        map.delete(key);
+    }
+}
+
+function claimSelectionLease(accountKey: string | null, slotIndex: number): CodexSelectionLease {
+    const selectedAt = Date.now();
+    if (accountKey) incrementLeaseCounter(pendingLeasesByAccountKey, accountKey);
+    incrementLeaseCounter(pendingLeasesBySlotIndex, slotIndex);
+    slotLastSelectedAtByIndex.set(slotIndex, selectedAt);
+    return { accountKey, slotIndex, selectedAt };
+}
+
+function releaseSelectionLease(
+    lease: CodexSelectionLease | null,
+    sessionId: string | null,
+    rememberAffinity: boolean,
+): void {
+    if (!lease) return;
+    if (lease.accountKey) decrementLeaseCounter(pendingLeasesByAccountKey, lease.accountKey);
+    decrementLeaseCounter(pendingLeasesBySlotIndex, lease.slotIndex);
+    if (!rememberAffinity || !sessionId || !lease.accountKey) return;
+    sessionAffinities.set(sessionId, {
+        provider: 'codex',
+        accountKey: lease.accountKey,
+        slotIndex: lease.slotIndex,
+        lastSelectedAt: new Date(lease.selectedAt).toISOString(),
+        lastCompletedAt: new Date().toISOString(),
+    });
+}
+
+function getSessionAffinityContext(sessionId: string | null) {
+    if (!sessionId) return null;
+    const preferred = sessionAffinities.get(sessionId);
+    return {
+        sessionId,
+        cacheEligible: true,
+        preferredProvider: 'codex' as const,
+        preferredAccountKey: preferred?.accountKey ?? '',
+    };
+}
+
+async function getBalanceLoaderSelection(input: {
+    now: number;
+    sessionId: string | null;
+    excludedSlotIndexes: Set<number>;
+    excludedAccountKeys: Set<string>;
+}): Promise<{
+    selectedSlotIndex: number | null;
+    selectedAccountKey: string | null;
+    affinityApplied: boolean;
+    fallbackReason: string | null;
+}> {
+    if (process.env['OPENAI_CODEX_TOKEN']) {
+        return { selectedSlotIndex: null, selectedAccountKey: null, affinityApplied: false, fallbackReason: 'missing_usage' };
+    }
+
+    ensureCodexSlots();
+    const slotIdentities = authSlots.map((slot, slotIndex) => ({
+        slotIndex,
+        slotPath: slot.path,
+        accountKey: getSlotAccountKey(slot),
+        rateLimitedUntil: slot.rateLimitedUntil,
+    }));
+
+    const { getCodexUsageSelectorSnapshot } = await import('./codex-usage.js');
+    const selectorSnapshot = await getCodexUsageSelectorSnapshot({ slots: slotIdentities });
+    const explicitFallback = typeof (selectorSnapshot as unknown as { fallbackReason?: unknown }).fallbackReason === 'string'
+        ? (selectorSnapshot as unknown as { fallbackReason: string }).fallbackReason
+        : null;
+    if (explicitFallback) {
+        return { selectedSlotIndex: null, selectedAccountKey: null, affinityApplied: false, fallbackReason: explicitFallback };
+    }
+
+    const relevantSlots = slotIdentities.filter((slot) => {
+        if (slot.rateLimitedUntil > input.now) return false;
+        if (input.excludedSlotIndexes.has(slot.slotIndex)) return false;
+        return !(slot.accountKey && input.excludedAccountKeys.has(slot.accountKey));
+    });
+    const relevantSlotIndexes = new Set(relevantSlots.map((slot) => slot.slotIndex));
+    const relevantAccountKeys = new Set(relevantSlots.map((slot) => slot.accountKey).filter((accountKey): accountKey is string => Boolean(accountKey)));
+    if ((selectorSnapshot.unknownAccountSlotIndexes ?? []).some((slotIndex) => relevantSlotIndexes.has(slotIndex))) {
+        return { selectedSlotIndex: null, selectedAccountKey: null, affinityApplied: false, fallbackReason: 'unknown_account' };
+    }
+    if ((selectorSnapshot.missingUsageSlotIndexes ?? []).some((slotIndex) => relevantSlotIndexes.has(slotIndex))) {
+        return { selectedSlotIndex: null, selectedAccountKey: null, affinityApplied: false, fallbackReason: 'missing_usage' };
+    }
+    if ((selectorSnapshot.staleAccountKeys ?? []).some((accountKey) => relevantAccountKeys.has(accountKey))) {
+        return { selectedSlotIndex: null, selectedAccountKey: null, affinityApplied: false, fallbackReason: 'stale_usage' };
+    }
+
+    const { selectCodexBalanceCandidate } = await import('./codex-balance-loader.js');
+    const result = selectCodexBalanceCandidate({
+        now: input.now,
+        provider: 'codex',
+        accounts: selectorSnapshot.accounts,
+        slots: relevantSlots
+            .filter((slot) => slot.accountKey)
+            .map((slot) => ({
+                slotIndex: slot.slotIndex,
+                accountKey: slot.accountKey!,
+                pendingLeases: pendingLeasesBySlotIndex.get(slot.slotIndex) ?? 0,
+                lastSelectedAt: slotLastSelectedAtByIndex.get(slot.slotIndex)
+                    ? new Date(slotLastSelectedAtByIndex.get(slot.slotIndex)!).toISOString()
+                    : null,
+                rateLimitedUntil: slot.rateLimitedUntil,
+            })),
+        excludedSlotIndexes: input.excludedSlotIndexes,
+        excludedAccountKeys: input.excludedAccountKeys,
+        sessionAffinity: getSessionAffinityContext(input.sessionId),
+    });
+
+    return {
+        selectedSlotIndex: result.selectedSlotIndex,
+        selectedAccountKey: result.selectedAccountKey,
+        affinityApplied: result.affinityApplied,
+        fallbackReason: result.fallbackReason,
+    };
+}
 
 // ── Auth Loading ───────────────────────────────────────────────────
 
@@ -129,24 +317,21 @@ function isTokenExpired(accessToken: string): boolean {
 }
 
 /**
- * Resolve auth file paths (supports multi-key rotation).
+ * Resolve auth file paths (supports multi-key rotation and CODEX_HOME-style dirs).
  */
 export function resolveAuthPaths(): string[] {
     const multiPaths = process.env['OPENAI_CODEX_AUTH_PATHS'];
     if (multiPaths && multiPaths.trim()) {
-        return multiPaths.split(',').map(p => p.trim()).filter(Boolean);
+        return multiPaths.split(',').map(resolveAuthPathEntry).filter(Boolean);
     }
     if (process.env['OPENAI_CODEX_AUTH_PATH']) {
-        return [process.env['OPENAI_CODEX_AUTH_PATH']];
+        return [resolveAuthPathEntry(process.env['OPENAI_CODEX_AUTH_PATH'])];
     }
     if (process.env['OPENAI_CODEX_TOKEN']) {
         return []; // Token mode, no file-based rotation
     }
-    const codexHome = process.env['CODEX_HOME'];
-    const defaultPath = codexHome
-        ? join(codexHome, 'auth.json')
-        : join(homedir(), '.codex', 'auth.json');
-    return [defaultPath];
+    const codexHome = process.env['CODEX_HOME'] || join(homedir(), '.codex');
+    return [resolveAuthPathEntry(codexHome)];
 }
 
 /**
@@ -169,7 +354,13 @@ function readAuthFile(path: string): Record<string, unknown> | null {
 async function refreshTokens(
     refreshToken: string,
     proxyAgent: ProxyAgent | null,
+    timeoutMs?: number,
 ): Promise<{ accessToken: string; idToken?: string; refreshToken: string; accountId?: string } | null> {
+    const controller = new AbortController();
+    const timeoutId = timeoutMs && timeoutMs > 0
+        ? setTimeout(() => controller.abort(), timeoutMs)
+        : null;
+
     try {
         const fetchOptions: RequestInit & { dispatcher?: unknown } = {
             method: 'POST',
@@ -180,6 +371,7 @@ async function refreshTokens(
                 client_id: OAUTH_CLIENT_ID,
                 scope: 'openid profile email offline_access',
             }),
+            signal: controller.signal,
         };
         if (proxyAgent) fetchOptions.dispatcher = proxyAgent;
 
@@ -204,6 +396,8 @@ async function refreshTokens(
     } catch (err) {
         console.warn('[codex-transport] Token refresh failed:', err instanceof Error ? err.message : err);
         return null;
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
     }
 }
 
@@ -235,7 +429,7 @@ function writeAuthFile(
  * Load auth from a specific file path (read, check expiry, refresh if needed).
  * Returns null if no valid credentials are found.
  */
-async function loadAuthFromFile(path: string, proxyAgent: ProxyAgent | null): Promise<CodexAuth | null> {
+async function loadAuthFromFile(path: string, proxyAgent: ProxyAgent | null, timeoutMs?: number): Promise<CodexAuth | null> {
     const authData = readAuthFile(path);
     if (!authData) return null;
 
@@ -250,7 +444,7 @@ async function loadAuthFromFile(path: string, proxyAgent: ProxyAgent | null): Pr
     // Refresh if expired or about to expire
     if (isTokenExpired(accessToken) && refreshToken) {
         console.log(`[codex-transport] Access token expired for ${path}, refreshing...`);
-        const refreshed = await refreshTokens(refreshToken, proxyAgent);
+        const refreshed = await refreshTokens(refreshToken, proxyAgent, timeoutMs);
         if (refreshed) {
             accessToken = refreshed.accessToken;
             idToken = refreshed.idToken ?? idToken;
@@ -277,6 +471,49 @@ async function loadAuthFromFile(path: string, proxyAgent: ProxyAgent | null): Pr
     return { accessToken, accountId, refreshToken, idToken, sourcePath: path };
 }
 
+function ensureCodexSlots(): void {
+    if (process.env['OPENAI_CODEX_TOKEN']) return;
+    if (authSlots.length === 0) initializeSlots(resolveAuthPaths());
+}
+
+export function getCodexAuthSlots(): CodexAuthSlotSnapshot[] {
+    if (process.env['OPENAI_CODEX_TOKEN']) {
+        return [{ slotIndex: 0, path: null, rateLimitedUntil: 0 }];
+    }
+
+    ensureCodexSlots();
+    return authSlots.map((slot, slotIndex) => ({
+        slotIndex,
+        path: slot.path,
+        rateLimitedUntil: slot.rateLimitedUntil,
+    }));
+}
+
+export async function loadCodexUsageAuthSlot(
+    slot: CodexAuthSlotSnapshot,
+    proxyAgent: ProxyAgent | null,
+    timeoutMs?: number,
+): Promise<CodexAuth | null> {
+    if (process.env['OPENAI_CODEX_TOKEN']) {
+        const accessToken = process.env['OPENAI_CODEX_TOKEN'];
+        return accessToken ? { accessToken, accountId: '' } : null;
+    }
+
+    ensureCodexSlots();
+    const existing = authSlots[slot.slotIndex];
+    if (!existing) return null;
+    if (existing.auth && !isTokenExpired(existing.auth.accessToken)) {
+        return existing.auth;
+    }
+
+    const auth = await loadAuthFromFile(existing.path, proxyAgent, timeoutMs);
+    if (auth) {
+        existing.auth = auth;
+        existing.lastLoadAttempt = Date.now();
+    }
+    return auth;
+}
+
 // ── Rotation Helpers ───────────────────────────────────────────────
 
 export function resetRotationState(): void {
@@ -285,6 +522,10 @@ export function resetRotationState(): void {
     lastRotationTime = 0;
     lastQueryEndTime = 0;
     activeRequests = 0;
+    sessionAffinities.clear();
+    pendingLeasesByAccountKey.clear();
+    pendingLeasesBySlotIndex.clear();
+    slotLastSelectedAtByIndex.clear();
     rotationIntervalMs = -1;
     rotationIdleMs = -1;
 }
@@ -374,6 +615,8 @@ type AuthResult =
 export async function getActiveCodexAuth(
     proxyAgent: ProxyAgent | null,
     excludedSlotIndexes = new Set<number>(),
+    preferredSlotIndex?: number,
+    excludedAccountKeys = new Set<string>(),
 ): Promise<AuthResult> {
     // Fast path: explicit token (no rotation)
     if (process.env['OPENAI_CODEX_TOKEN']) {
@@ -393,8 +636,12 @@ export async function getActiveCodexAuth(
     }
     if (authSlots.length === 0) return { ok: false, reason: 'auth_missing' };
 
-    // Check rotation BEFORE starting the request
-    if (shouldRotate()) performRotation();
+    // Check rotation BEFORE starting the request unless the selector requested a specific starting slot.
+    if (preferredSlotIndex !== undefined && authSlots[preferredSlotIndex] && !excludedSlotIndexes.has(preferredSlotIndex)) {
+        currentSlotIndex = preferredSlotIndex;
+    } else if (shouldRotate()) {
+        performRotation();
+    }
 
     // Increment BEFORE async work (prevents race conditions)
     activeRequests++;
@@ -406,6 +653,8 @@ export async function getActiveCodexAuth(
         const slotIndex = (currentSlotIndex + attempt) % authSlots.length;
         if (excludedSlotIndexes.has(slotIndex)) continue;
         const slot = authSlots[slotIndex]!;
+        const slotAccountKey = getSlotAccountKey(slot);
+        if (slotAccountKey && excludedAccountKeys.has(slotAccountKey)) continue;
 
         // Skip slots that are currently rate-limited
         if (slot.rateLimitedUntil > now) {
@@ -1653,9 +1902,12 @@ export async function makeCodexRequest(
     request: Record<string, unknown>,
     modelId: string,
     proxyAgent: ProxyAgent | null,
+    executionContext: RequestExecutionContext = { sessionId: null },
 ): Promise<Response> {
     // 1. Extract model name (strip codex/ prefix)
     const modelName = modelId.includes('/') ? modelId.split('/').slice(1).join('/') : modelId;
+    const sessionId = executionContext.sessionId ?? extractSessionIdFromRequest(request);
+    const balanceLoaderMode = getBalanceLoaderMode();
 
     // 2. Build the Responses API request body
     const body = buildCodexRequestBody(request, modelName);
@@ -1664,13 +1916,33 @@ export async function makeCodexRequest(
     // 3. Try each available slot (current first, then rotate on 429)
     let lastErrorResponse: Response | null = null;
     const triedSlotIndexes = new Set<number>();
+    const excludedAccountKeys = new Set<string>();
+    let preferredSlotIndex: number | undefined;
+    let preferredAccountKey: string | null = null;
     const configuredSlotCount = process.env['OPENAI_CODEX_TOKEN']
         ? 1
         : (authSlots.length > 0 ? authSlots.length : resolveAuthPaths().length);
     const slotCount = Math.max(configuredSlotCount, 1); // at least 1 attempt
 
     for (let attempt = 0; attempt < slotCount; attempt++) {
-        const result = await getActiveCodexAuth(proxyAgent, triedSlotIndexes);
+        if (attempt === 0 && balanceLoaderMode !== 'off' && !process.env['OPENAI_CODEX_TOKEN']) {
+            try {
+                const selection = await getBalanceLoaderSelection({
+                    now: Date.now(),
+                    sessionId,
+                    excludedSlotIndexes: triedSlotIndexes,
+                    excludedAccountKeys,
+                });
+                preferredAccountKey = selection.selectedAccountKey;
+                if (balanceLoaderMode === 'on' && selection.fallbackReason === null && selection.selectedSlotIndex !== null) {
+                    preferredSlotIndex = selection.selectedSlotIndex;
+                }
+            } catch {
+                // Legacy rotation remains the compatibility fallback.
+            }
+        }
+
+        const result = await getActiveCodexAuth(proxyAgent, triedSlotIndexes, preferredSlotIndex, excludedAccountKeys);
         if (!result.ok) {
             if (result.reason === 'all_rate_limited') {
                 const resetInfo = getEarliestRateLimitInfo();
@@ -1702,6 +1974,10 @@ export async function makeCodexRequest(
         }
 
         const slotUsed = currentSlotIndex;
+        const accountKeyUsed = result.auth.accountId
+            ? hashAccountKey(result.auth.accountId)
+            : preferredAccountKey;
+        const lease = claimSelectionLease(accountKeyUsed, slotUsed);
         const response = await executeCodexCall(
             result.auth,
             body,
@@ -1717,11 +1993,13 @@ export async function makeCodexRequest(
 
         // Success or non-retriable error → return immediately
         if (response.status !== 429 && response.status !== 500) {
+            releaseSelectionLease(lease, sessionId, response.ok);
             return response;
         }
 
         // 429 or 500 → rotate to next slot and retry
         const errBody = await response.text();
+        releaseSelectionLease(lease, sessionId, false);
         if (!shouldRetryCodexError(response.status, errBody)) {
             return new Response(
                 errBody,
@@ -1740,6 +2018,7 @@ export async function makeCodexRequest(
                 + (attempt + 1 < slotCount ? ` (attempt ${attempt + 1}/${slotCount})` : ' (no more slots)'),
             );
             markSlotRateLimited(slotUsed, errBody);
+            if (accountKeyUsed) excludedAccountKeys.add(accountKeyUsed);
         } else {
             // 500 — server error, may be account-specific; try next slot without rate-limit penalty
             console.warn(

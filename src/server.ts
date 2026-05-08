@@ -32,6 +32,7 @@ import { generateRequestId, nowIso, stripMetadataPreamble } from './utils.js';
 import { responsesBodyToChatCompletions, chatCompletionToResponsesBody, responsesBodyToSSEResponse } from './responses-adapter.js';
 import { discoverProviderModels, DiscoveredModelCandidate, getCandidateMissingFields } from './provider-discovery.js';
 import { RuntimeStateManager } from './runtime-state.js';
+import { getCodexUsage } from './codex-usage.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -46,6 +47,16 @@ type CreateAppOptions = {
     projectRoot?: string;
     runtimeState?: RuntimeStateManager;
 };
+
+function extractSessionIdFromMessages(messages: ChatCompletionRequest['messages'] | undefined): string | null {
+    const systemMessage = (messages ?? []).find((message) => message.role === 'system');
+    const systemContent = typeof systemMessage?.content === 'string' ? systemMessage.content : '';
+    const senderMatch = systemContent.match(/"sender_id"\s*:\s*"(\d+)"/);
+    const senderId = senderMatch?.[1];
+    return senderId
+        ? createHash('sha256').update(senderId).digest('hex').slice(0, 8)
+        : null;
+}
 
 export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {}): Hono {
     const app = new Hono();
@@ -213,6 +224,25 @@ export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {
         }
     });
 
+    app.get('/dashboard-codex', (c) => {
+        try {
+            const filename = 'dashboard-codex.html';
+            const dashboardPath = join(__dirname, '..', 'web', filename);
+            if (existsSync(dashboardPath)) {
+                return c.html(readFileSync(dashboardPath, 'utf-8'));
+            }
+
+            const distPath = join(__dirname, '..', 'dist', 'web', filename);
+            if (existsSync(distPath)) {
+                return c.html(readFileSync(distPath, 'utf-8'));
+            }
+
+            return c.html(`<html><body><h1>Codex dashboard not found</h1><p>Expected file: web/${filename}</p></body></html>`);
+        } catch {
+            return c.html('<html><body><h1>Error loading Codex dashboard</h1></body></html>');
+        }
+    });
+
     // Legacy Dashboard (v1.0)
     app.get('/dashboard', (c) => {
         try {
@@ -242,6 +272,22 @@ export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {
     app.get('/api/config', (c) => {
         const redacted = getRedactedConfig(config);
         return c.json(redacted);
+    });
+
+    app.get('/api/codex/usage', async (c) => {
+        try {
+            const result = await getCodexUsage();
+            return c.json(result.body, result.status as 200 | 502);
+        } catch (error) {
+            return c.json({
+                partial: false,
+                accounts: [],
+                slotErrors: [],
+                error: {
+                    message: error instanceof Error ? error.message : 'Failed to load Codex usage',
+                },
+            }, 502);
+        }
     });
 
     app.post('/api/admin/models/discover', async (c) => {
@@ -528,6 +574,7 @@ export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {
             const body = await c.req.json() as ChatCompletionRequest;
             const runtimeSnapshot = getRuntimeSnapshot();
             const runtimeConfig = getRuntimeConfigFromSnapshot(runtimeSnapshot);
+            const sessionId = extractSessionIdFromMessages(body.messages);
 
             if (config.logging.debugMode) {
                 console.log(`[${requestId}] Incoming request for model: ${body.model}`);
@@ -559,7 +606,7 @@ export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {
             }
 
             // Execute the request
-            const result = await executeRequest(body, routing, classification, runtimeConfig, runtimeSnapshot.modelCatalog);
+            const result = await executeRequest(body, routing, classification, runtimeConfig, runtimeSnapshot.modelCatalog, { sessionId });
 
             // Build the log entry for this request.
             // For streaming: called by executor after stream completes (accurate tokens).
@@ -588,15 +635,6 @@ export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {
                     tool_count: (body.tools ?? []).length,
                     last_role: (body.messages ?? []).at(-1)?.role ?? null,
                 });
-
-                // P3b: Extract session ID from system prompt sender_id (hashed for privacy)
-                const sysMsg = (body.messages ?? []).find((m) => m.role === 'system');
-                const sysContent = typeof sysMsg?.content === 'string' ? sysMsg.content : '';
-                const senderMatch = sysContent.match(/"sender_id"\s*:\s*"(\d+)"/);
-                const senderId = senderMatch?.[1];
-                const sessionId = senderId
-                    ? createHash('sha256').update(senderId).digest('hex').slice(0, 8)
-                    : null;
 
                 const logEntry: LogEntry = {
                     timestamp: nowIso(),
@@ -698,6 +736,7 @@ export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {
 
             // Translate Responses API → Chat Completions
             const ccRequest = responsesBodyToChatCompletions(body);
+            const sessionId = extractSessionIdFromMessages(ccRequest.messages);
 
             // Always execute non-streaming internally; we wrap into SSE if the client wants streaming.
             ccRequest.stream = false;
@@ -717,7 +756,7 @@ export function createApp(config: ClawRouteConfig, options: CreateAppOptions = {
             // Classify → Route → Execute
             const classification = classifyRequest(ccRequest, runtimeConfig);
             const routing = routeRequest(ccRequest, classification, runtimeConfig, runtimeSnapshot.modelCatalog);
-            const result = await executeRequest(ccRequest, routing, classification, runtimeConfig, runtimeSnapshot.modelCatalog);
+            const result = await executeRequest(ccRequest, routing, classification, runtimeConfig, runtimeSnapshot.modelCatalog, { sessionId });
 
             // Translate CC response back to Responses API format
             const ccJson = await result.response.json() as Record<string, unknown>;

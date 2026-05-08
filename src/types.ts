@@ -162,6 +162,10 @@ export interface ExecutionResult {
     logWhenDone?: () => void;
 }
 
+export interface RequestExecutionContext {
+    sessionId: string | null;
+}
+
 // === Config ===
 
 /**
@@ -559,4 +563,175 @@ export interface AlertsConfig {
     email?: string;
     /** Slack webhook URL for alerts */
     slackWebhook?: string;
+}
+
+// === Codex Usage ===
+
+export type CodexUsageWindowKey = 'fiveHour' | 'weekly';
+
+export interface CodexUsageRawWindow {
+    limit_window_seconds?: number;
+    used_percent?: number;
+    reset_at?: number;
+    resets_at?: number;
+    resets_in_seconds?: number;
+}
+
+export interface CodexUsageRawRateLimit {
+    primary_window?: CodexUsageRawWindow;
+    secondary_window?: CodexUsageRawWindow;
+}
+
+export interface CodexUsageRawResponse {
+    account_id?: string;
+    primary_window?: CodexUsageRawWindow;
+    secondary_window?: CodexUsageRawWindow;
+    rate_limit?: CodexUsageRawRateLimit;
+}
+
+export interface CodexUsageWindowSnapshot {
+    window: CodexUsageWindowKey;
+    usedPercent: number;
+    resetAt: string;
+    windowMinutes: number;
+    updatedAt: string;
+}
+
+export type CodexUsageRowSource = 'live' | 'cache' | 'persisted' | 'cooldown';
+
+export interface CodexUsageAccountRow {
+    accountKey: string;
+    slotIndex: number;
+    slotIndexes: number[];
+    slotPaths: string[];
+    source: CodexUsageRowSource;
+    stale: boolean;
+    cooldownUntil: string | null;
+    lastFetchedAt: string | null;
+    updatedAt: string | null;
+    fiveHour: CodexUsageWindowSnapshot | null;
+    weekly: CodexUsageWindowSnapshot | null;
+}
+
+export interface CodexUsageSnapshotRecord {
+    accountKey: string;
+    slotIndex: number;
+    window: CodexUsageWindowKey;
+    usedPercent: number;
+    resetAt: string;
+    windowMinutes: number;
+    updatedAt: string;
+}
+
+export interface CodexUsageSlotError {
+    slotIndex: number;
+    message: string;
+    source: CodexUsageRowSource | 'none';
+}
+
+export interface CodexUsageApiBody {
+    partial: boolean;
+    accounts: CodexUsageAccountRow[];
+    slotErrors: CodexUsageSlotError[];
+    error?: {
+        message: string;
+    };
+}
+
+export interface CodexUsageResult {
+    status: number;
+    body: CodexUsageApiBody;
+}
+
+export interface CodexUsageSelectorSlotIdentity {
+    slotIndex: number;
+    slotPath: string | null;
+    accountKey: string | null;
+    rateLimitedUntil: number;
+}
+
+export interface CodexUsageSelectorRequest {
+    slots: CodexUsageSelectorSlotIdentity[];
+    persistedMaxAgeMs?: number;
+    refreshThrottleMs?: number;
+}
+
+export interface CodexUsageSelectorSnapshot {
+    slots: CodexUsageSelectorSlotIdentity[];
+    accounts: CodexUsageAccountRow[];
+    unknownAccountSlotIndexes: number[];
+    missingUsageSlotIndexes: number[];
+    staleAccountKeys: string[];
+    triggeredBackgroundRefresh: boolean;
+}
+
+export interface CodexSessionAccountAffinity {
+    provider: ProviderType;
+    accountKey: string;
+    slotIndex?: number;
+    lastSelectedAt?: string | null;
+    lastCompletedAt?: string | null;
+}
+
+export interface CodexBalanceLoaderAffinityContext {
+    sessionId: string | null;
+    cacheEligible: boolean;
+    preferred: CodexSessionAccountAffinity | null;
+}
+
+export type CodexBalanceLoaderFallbackReason =
+    | 'missing_usage'
+    | 'stale_usage'
+    | 'cooldown_only'
+    | 'unknown_account'
+    | 'no_eligible_slot'
+    | 'selector_error';
+
+export type CodexBalanceLoaderAffinityStatus =
+    | 'not_requested'
+    | 'cache_hint_missing'
+    | 'provider_mismatch'
+    | 'preferred_missing'
+    | 'preferred_ineligible'
+    | 'preferred_low_headroom'
+    | 'score_gap'
+    | 'best_score'
+    | 'applied';
+
+export interface CodexBalanceLoaderRequest {
+    now: number;
+    provider: ProviderType;
+    snapshot: CodexUsageSelectorSnapshot;
+    excludedSlotIndexes?: ReadonlySet<number> | readonly number[];
+    excludedAccountKeys?: ReadonlySet<string> | readonly string[];
+    pendingLeasesByAccountKey?: Readonly<Record<string, number>>;
+    slotPendingLeasesByIndex?: Readonly<Record<number, number>>;
+    slotLastSelectedAtByIndex?: Readonly<Record<number, number>>;
+    persistedMaxAgeMs?: number;
+    affinity?: CodexBalanceLoaderAffinityContext | null;
+}
+
+export interface CodexBalanceLoaderAccountScore {
+    accountKey: string;
+    slotIndexes: number[];
+    baseScore: number;
+    source: CodexUsageRowSource;
+    pendingLeases: number;
+    bottleneckResidual: number | null;
+    fiveHourResidual: number | null;
+    weeklyResidual: number | null;
+}
+
+export interface CodexBalanceLoaderSelection {
+    accountKey: string;
+    slotIndex: number;
+    slotIndexes: number[];
+    baseScore: number;
+}
+
+export interface CodexBalanceLoaderResult {
+    selection: CodexBalanceLoaderSelection | null;
+    fallbackReason: CodexBalanceLoaderFallbackReason | null;
+    affinityStatus: CodexBalanceLoaderAffinityStatus;
+    scores: CodexBalanceLoaderAccountScore[];
 }

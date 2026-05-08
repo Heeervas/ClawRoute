@@ -170,4 +170,42 @@ describe('makeCodexRequest 429 regressions', () => {
         expect(body.error['resets_in_seconds']).toBeGreaterThan(0);
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
+
+    it('excludes sibling duplicate slots for the rest of the request after usage_limit_reached', async () => {
+        const dir = makeTempDir();
+        const firstPath = writeAuth(dir, 'first.json', 'token-first', 'acct-shared');
+        const duplicatePath = writeAuth(dir, 'duplicate.json', 'token-duplicate', 'acct-shared');
+        const backupPath = writeAuth(dir, 'backup.json', 'token-backup', 'acct-backup');
+        vi.stubEnv('OPENAI_CODEX_AUTH_PATHS', `${firstPath},${duplicatePath},${backupPath}`);
+
+        const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+            const authorization = authHeader(init);
+            if (authorization === 'Bearer token-first') {
+                return codex429('shared account exhausted', 'usage_limit_reached', {
+                    resets_at: Math.floor(Date.now() / 1000) + 120,
+                    resets_in_seconds: 120,
+                });
+            }
+            if (authorization === 'Bearer token-duplicate') {
+                return successResponse('shared sibling slot should be skipped');
+            }
+            if (authorization === 'Bearer token-backup') {
+                return successResponse('backup account handled the retry');
+            }
+            throw new Error(`Unexpected Authorization header: ${authorization}`);
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        const response = await makeCodexRequest(baseRequest, 'codex/gpt-5.4-mini', null);
+        const body = await response.json() as Record<string, unknown>;
+        const choices = body['choices'] as Array<Record<string, unknown>>;
+        const message = choices[0]?.['message'] as Record<string, unknown>;
+
+        expect(response.status).toBe(200);
+        expect(fetchMock.mock.calls.map(([, init]) => authHeader(init))).toEqual([
+            'Bearer token-first',
+            'Bearer token-backup',
+        ]);
+        expect(message['content']).toBe('backup account handled the retry');
+    });
 });

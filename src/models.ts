@@ -138,6 +138,18 @@ export const DEFAULT_MODELS: ModelEntry[] = [
         enabled: true,
     },
 
+    // OpenAI image generation (explicit routing only — not in auto-tier table)
+    {
+        id: 'openai/gpt-image-2',
+        provider: 'openai',
+        inputCostPer1M: 5.00,
+        outputCostPer1M: 30.00,
+        maxContext: 32768,
+        toolCapable: false,
+        multimodal: true,
+        enabled: true,
+    },
+
     // Local / Ollama (explicit routing only — not in auto-tier table)
     {
         id: 'ollama/llama3.2:1b',

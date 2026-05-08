@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Codex Usage Dashboard</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --card: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-muted: #8b949e;
+            --green: #3fb950;
+            --blue: #58a6ff;
+            --purple: #a371f7;
+            --yellow: #d29922;
+            --red: #f85149;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+        }
+
+        #portal-nav {
+            display: none;
+            background: rgba(13, 17, 23, 0.95);
+            border-bottom: 1px solid var(--border);
+            padding: 8px 24px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(8px);
+        }
+
+        .portal-inner, header, .section-head, .account-head, .auth-row, .window-row, .status-grid {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .portal-inner, .container { max-width: 1200px; margin: 0 auto; }
+        .portal-link, .text-link { color: var(--blue); text-decoration: none; }
+        .portal-current, .lede, .card-sub, .account-meta, .window-copy, .muted, footer { color: var(--text-muted); }
+        .container { padding: 24px; }
+        header, .section-head, .account-head, .auth-row, .status-grid { justify-content: space-between; flex-wrap: wrap; }
+        header { margin-bottom: 24px; }
+        h1 { font-size: 28px; line-height: 1.2; }
+        h2 { font-size: 18px; }
+        .eyebrow, .card-label, .section-title, .window-label {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .header-actions, .badge-row { display: flex; gap: 12px; flex-wrap: wrap; }
+        .grid, .account-list, .window-list, .error-list { display: grid; gap: 16px; }
+        .grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 24px; }
+        .card, .section, .account-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .card-value { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        .section { margin-bottom: 24px; }
+        .section-title { color: var(--text); }
+        .hidden { display: none !important; }
+
+        .button, button, input {
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            font: inherit;
+        }
+
+        .button, button {
+            background: var(--card);
+            color: var(--text);
+            padding: 8px 16px;
+            cursor: pointer;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .button:hover, button:hover { background: var(--border); }
+        .button.primary, button.primary { background: var(--green); border-color: var(--green); color: #fff; }
+        input {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .banner { border-left: 3px solid var(--blue); }
+        .banner.warn { border-left-color: var(--yellow); }
+        .banner.error { border-left-color: var(--red); }
+        .banner.success { border-left-color: var(--green); }
+        .status-grid { align-items: flex-start; }
+        .status-copy { flex: 1 1 260px; }
+        .status-copy strong { display: block; margin-bottom: 4px; }
+        .status-meta { font-size: 12px; color: var(--text-muted); }
+
+        .badge {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            border: 1px solid transparent;
+        }
+
+        .badge-live, .badge-cache, .badge-stale { color: var(--blue); border-color: rgba(88, 166, 255, 0.35); }
+        .badge-cooldown, .badge-partial { color: var(--yellow); border-color: rgba(210, 153, 34, 0.35); }
+        .badge-persisted { color: var(--purple); border-color: rgba(163, 113, 247, 0.35); }
+
+        .account-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+        .account-key { font-size: 18px; font-weight: 700; }
+        .window-list { margin-top: 16px; }
+        .window-row {
+            display: grid;
+            grid-template-columns: 74px 1fr minmax(96px, 120px);
+            gap: 12px;
+            align-items: center;
+        }
+
+        .progress-track {
+            height: 10px;
+            background: var(--bg);
+            border-radius: 999px;
+            overflow: hidden;
+            margin-bottom: 6px;
+        }
+
+        .progress-bar { height: 100%; border-radius: 999px; }
+        .progress-ok { background: var(--green); }
+        .progress-warn { background: var(--yellow); }
+        .progress-high { background: var(--red); }
+        .window-stats { text-align: right; font-variant-numeric: tabular-nums; }
+        .window-stats strong { display: block; font-size: 18px; }
+        .empty-state, .empty-window {
+            padding: 20px;
+            border: 1px dashed rgba(139, 148, 158, 0.35);
+            border-radius: 12px;
+            color: var(--text-muted);
+        }
+
+        .error-list { list-style: none; }
+        .error-item {
+            padding: 12px 14px;
+            border-radius: 10px;
+            background: rgba(248, 81, 73, 0.08);
+            border: 1px solid rgba(248, 81, 73, 0.25);
+        }
+
+        footer { text-align: center; margin-top: 36px; font-size: 12px; }
+
+        @media (max-width: 720px) {
+            .container { padding: 16px; }
+            .card-value { font-size: 24px; }
+            .window-row { grid-template-columns: 1fr; }
+            .window-stats { text-align: left; }
+        }
+    </style>
+</head>
+<body>
+    <nav id="portal-nav">
+        <div class="portal-inner">
+            <a href="/" class="portal-link">Services</a>
+            <span class="portal-current">> Codex Usage</span>
+        </div>
+    </nav>
+
+    <div class="container">
+        <header>
+            <div>
+                <p class="eyebrow">Operator</p>
+                <h1>Codex Usage Dashboard</h1>
+                <p class="lede">Same-origin Codex quota visibility for 5h, Weekly, stale, partial, and cooldown-only states.</p>
+            </div>
+            <div class="header-actions">
+                <a id="back-link" class="button" href="/dashboard2">ClawRoute 2.0</a>
+                <button id="refresh-button" type="button" class="primary">Refresh</button>
+            </div>
+        </header>
+
+        <section id="auth-card" class="section hidden">
+            <div class="section-head">
+                <div>
+                    <h2 class="section-title">Bearer Token Required</h2>
+                    <p id="auth-copy" class="muted">A 401 means /api/codex/usage needs Authorization. The token stays in sessionStorage for this tab only.</p>
+                </div>
+            </div>
+            <form id="auth-form" class="auth-form">
+                <label class="window-copy" for="token-input">Bearer token</label>
+                <div class="auth-row">
+                    <input id="token-input" name="token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste CLAWROUTE_TOKEN">
+                    <button type="submit" class="primary">Save Token</button>
+                    <button id="clear-token" type="button">Forget Token</button>
+                </div>
+            </form>
+        </section>
+
+        <div class="grid">
+            <div class="card">
+                <p class="card-label">Accounts</p>
+                <p id="summary-accounts" class="card-value">0</p>
+                <p id="summary-accounts-sub" class="card-sub">Waiting for first sync</p>
+            </div>
+            <div class="card">
+                <p class="card-label">Last Sync</p>
+                <p id="summary-sync" class="card-value">-</p>
+                <p id="summary-sync-sub" class="card-sub">No live fetch yet</p>
+            </div>
+            <div class="card">
+                <p class="card-label">Fallback Rows</p>
+                <p id="summary-fallbacks" class="card-value">0</p>
+                <p id="summary-fallbacks-sub" class="card-sub">Cache, persisted, or cooldown</p>
+            </div>
+            <div class="card">
+                <p class="card-label">Slot Errors</p>
+                <p id="summary-errors" class="card-value">0</p>
+                <p id="summary-errors-sub" class="card-sub">No degraded slots</p>
+            </div>
+        </div>
+
+        <section id="status-banner" class="section banner">
+            <div class="status-grid">
+                <div class="status-copy">
+                    <strong id="status-title">Loading Codex usage</strong>
+                    <p id="status-copy" class="muted">Fetching /api/codex/usage from the current origin.</p>
+                </div>
+                <p id="status-meta" class="status-meta">No last updated metadata yet.</p>
+            </div>
+        </section>
+
+        <section class="section">
+            <div class="section-head">
+                <div>
+                    <h2 class="section-title">Accounts</h2>
+                    <p class="muted">One row per accountKey with slotIndex as secondary context.</p>
+                </div>
+                <p id="accounts-meta" class="status-meta">No data loaded.</p>
+            </div>
+            <div id="accounts-body" class="account-list">
+                <div class="empty-state">Loading live and cached Codex usage windows.</div>
+            </div>
+        </section>
+
+        <section id="errors-section" class="section hidden">
+            <div class="section-head">
+                <div>
+                    <h2 class="section-title">Slot Errors</h2>
+                    <p class="muted">Partial fetch errors and fallback sources.</p>
+                </div>
+            </div>
+            <ul id="errors-body" class="error-list"></ul>
+        </section>
+
+        <footer>Codex Usage Dashboard • <span id="footer-sync">No last sync yet</span></footer>
+    </div>
+
+    <script>
+        const BASE = location.pathname.startsWith('/clawroute') ? '/clawroute' : '';
+        const TOKEN_KEY = 'clawroute.codexUsageToken';
+        const REFRESH_MS = 60000;
+        const sourceRank = { live: 0, cache: 1, persisted: 2, cooldown: 3 };
+
+        const portalNav = document.getElementById('portal-nav');
+        const backLink = document.getElementById('back-link');
+        const refreshButton = document.getElementById('refresh-button');
+        const authCard = document.getElementById('auth-card');
+        const authCopy = document.getElementById('auth-copy');
+        const authForm = document.getElementById('auth-form');
+        const tokenInput = document.getElementById('token-input');
+        const clearTokenButton = document.getElementById('clear-token');
+        const errorsSection = document.getElementById('errors-section');
+        const accountsBody = document.getElementById('accounts-body');
+
+        if (BASE) portalNav.style.display = 'block';
+        backLink.href = `${BASE}/dashboard2`;
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+        }
+
+        function getRows(payload) {
+            if (Array.isArray(payload?.accounts)) return payload.accounts;
+            return Array.isArray(payload?.rows) ? payload.rows : [];
+        }
+
+        function getErrors(payload) {
+            return Array.isArray(payload?.slotErrors) ? payload.slotErrors : [];
+        }
+
+        function latestIso(values) {
+            return values.filter(Boolean).sort((left, right) => Date.parse(right) - Date.parse(left))[0] || null;
+        }
+
+        function fmtDate(value) {
+            if (!value) return '-';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return '-';
+            return date.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function fmtPercent(value) {
+            return `${Math.round(Number(value) || 0)}%`;
+        }
+
+        function relativeTime(value) {
+            if (!value) return 'unknown';
+            const diff = Date.parse(value) - Date.now();
+            const abs = Math.abs(diff);
+            const minutes = Math.floor(abs / 60000);
+            const hours = Math.floor(minutes / 60);
+            if (abs < 60000) return diff >= 0 ? 'in <1m' : '<1m ago';
+            if (hours >= 24) {
+                const days = Math.floor(hours / 24);
+                return diff >= 0 ? `in ${days}d` : `${days}d ago`;
+            }
+            if (hours >= 1) return diff >= 0 ? `in ${hours}h ${minutes % 60}m` : `${hours}h ${minutes % 60}m ago`;
+            return diff >= 0 ? `in ${minutes}m` : `${minutes}m ago`;
+        }
+
+        function countdownText(value) {
+            if (!value) return 'No countdown';
+            const diff = Date.parse(value) - Date.now();
+            if (!Number.isFinite(diff)) return 'Unknown';
+            if (diff <= 0) return 'now';
+            const seconds = Math.floor(diff / 1000);
+            const days = Math.floor(seconds / 86400);
+            const hours = Math.floor((seconds % 86400) / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+            if (hours > 0) return `${hours}h ${minutes}m`;
+            return `${minutes}m ${seconds % 60}s`;
+        }
+
+        function updateCountdowns() {
+            document.querySelectorAll('[data-countdown]').forEach((element) => {
+                element.textContent = countdownText(element.getAttribute('data-countdown'));
+            });
+        }
+
+        function progressTone(value) {
+            if (value >= 90) return 'progress-high';
+            if (value >= 70) return 'progress-warn';
+            return 'progress-ok';
+        }
+
+        function sourceLabel(source) {
+            return { live: 'Live', cache: 'Cache', persisted: 'Persisted', cooldown: 'Cooldown' }[source] || 'Unknown';
+        }
+
+        function sourceBadge(source) {
+            return `badge-${source || 'persisted'}`;
+        }
+
+        function betterRow(candidate, current) {
+            if (!current) return true;
+            return (sourceRank[candidate.source] ?? 9) < (sourceRank[current.source] ?? 9)
+                || ((sourceRank[candidate.source] ?? 9) === (sourceRank[current.source] ?? 9) && Number(candidate.stale) < Number(current.stale));
+        }
+
+        function newerWindow(candidate, current) {
+            if (!candidate) return current;
+            if (!current) return candidate;
+            return Date.parse(candidate.updatedAt || '') >= Date.parse(current.updatedAt || '') ? candidate : current;
+        }
+
+        function rowSlotIndexes(row) {
+            if (Array.isArray(row?.slotIndexes) && row.slotIndexes.length) {
+                return row.slotIndexes
+                    .map((value) => Number(value))
+                    .filter((value) => Number.isInteger(value))
+                    .sort((left, right) => left - right);
+            }
+            return Number.isInteger(row?.slotIndex) ? [row.slotIndex] : [];
+        }
+
+        function rowSlotPaths(row) {
+            if (!Array.isArray(row?.slotPaths)) return [];
+            return Array.from(new Set(row.slotPaths.filter((value) => typeof value === 'string' && value.trim())));
+        }
+
+        function groupRows(rows) {
+            const grouped = new Map();
+            for (const row of rows) {
+                const slotIndexes = rowSlotIndexes(row);
+                const slotPaths = rowSlotPaths(row);
+                const current = grouped.get(row.accountKey);
+                if (!current) {
+                    grouped.set(row.accountKey, {
+                        ...row,
+                        slotIndex: slotIndexes[0] ?? row.slotIndex,
+                        slotIndexes,
+                        slotPaths,
+                    });
+                    continue;
+                }
+                current.slotIndexes.push(...slotIndexes);
+                current.slotPaths.push(...slotPaths);
+                current.fiveHour = newerWindow(row.fiveHour, current.fiveHour);
+                current.weekly = newerWindow(row.weekly, current.weekly);
+                current.lastFetchedAt = latestIso([current.lastFetchedAt, row.lastFetchedAt]);
+                current.updatedAt = latestIso([current.updatedAt, row.updatedAt]);
+                current.cooldownUntil = latestIso([current.cooldownUntil, row.cooldownUntil]);
+                current.stale = current.stale && row.stale;
+                if (betterRow(row, current)) current.source = row.source;
+            }
+            return Array.from(grouped.values()).map((row) => ({
+                ...row,
+                slotIndexes: Array.from(new Set(row.slotIndexes)).sort((left, right) => left - right),
+                slotPaths: Array.from(new Set(row.slotPaths)),
+            })).sort((left, right) => left.slotIndexes[0] - right.slotIndexes[0]);
+        }
+
+        function syncMeta(accounts, errors) {
+            const fetched = latestIso(accounts.map((account) => account.lastFetchedAt));
+            const updated = latestIso(accounts.map((account) => account.updatedAt));
+            const parts = [];
+            if (fetched) parts.push(`Last sync ${fmtDate(fetched)} (${relativeTime(fetched)})`);
+            if (updated && updated !== fetched) parts.push(`Last updated ${fmtDate(updated)} (${relativeTime(updated)})`);
+            if (errors.length) parts.push(`${errors.length} degraded slot${errors.length === 1 ? '' : 's'}`);
+            return parts.length ? parts.join(' • ') : 'No last sync metadata yet.';
+        }
+
+        function setBanner(kind, title, copy, meta) {
+            const banner = document.getElementById('status-banner');
+            banner.className = `section banner ${kind}`;
+            document.getElementById('status-title').textContent = title;
+            document.getElementById('status-copy').textContent = copy;
+            document.getElementById('status-meta').textContent = meta;
+        }
+
+        function setAuthState(visible, message) {
+            authCard.classList.toggle('hidden', !visible);
+            authCopy.textContent = message;
+        }
+
+        function renderSummary(accounts, errors) {
+            const fallbackCount = accounts.filter((account) => account.source !== 'live').length;
+            const lastSync = latestIso(accounts.map((account) => account.lastFetchedAt));
+            document.getElementById('summary-accounts').textContent = String(accounts.length);
+            document.getElementById('summary-accounts-sub').textContent = accounts.length ? 'Grouped by accountKey' : 'No usage rows yet';
+            document.getElementById('summary-sync').textContent = lastSync ? fmtDate(lastSync) : '-';
+            document.getElementById('summary-sync-sub').textContent = lastSync ? relativeTime(lastSync) : 'No live fetch yet';
+            document.getElementById('summary-fallbacks').textContent = String(fallbackCount);
+            document.getElementById('summary-fallbacks-sub').textContent = fallbackCount ? 'Cache, persisted, or cooldown in use' : 'All accounts are live';
+            document.getElementById('summary-errors').textContent = String(errors.length);
+            document.getElementById('summary-errors-sub').textContent = errors.length ? 'Partial fetch or degraded fallback' : 'No degraded slots';
+            document.getElementById('accounts-meta').textContent = syncMeta(accounts, errors);
+            document.getElementById('footer-sync').textContent = syncMeta(accounts, errors);
+        }
+
+        function renderWindow(label, window) {
+            return `
+                <div class="window-row">
+                    <div class="window-label">${label}</div>
+                    <div>
+                        <div class="progress-track"><div class="progress-bar ${progressTone(window.usedPercent)}" style="width:${Math.max(0, Math.min(100, Number(window.usedPercent) || 0))}%"></div></div>
+                        <p class="window-copy">Resets ${escapeHtml(fmtDate(window.resetAt))} • <span data-countdown="${escapeHtml(window.resetAt)}"></span></p>
+                    </div>
+                    <div class="window-stats">
+                        <strong>${fmtPercent(window.usedPercent)}</strong>
+                        <span class="window-copy">${escapeHtml(String(window.windowMinutes))} min window</span>
+                    </div>
+                </div>`;
+        }
+
+        function renderAccount(account) {
+            const windows = [];
+            if (account.fiveHour) windows.push(renderWindow('5h', account.fiveHour));
+            if (account.weekly) windows.push(renderWindow('Weekly', account.weekly));
+            const secondary = `Slot${account.slotIndexes.length > 1 ? 's' : ''} ${account.slotIndexes.join(', ')}`;
+            const pathMeta = account.slotPaths?.length
+                ? `Path${account.slotPaths.length > 1 ? 's' : ''} ${account.slotPaths.join(', ')}`
+                : null;
+            const meta = [
+                `${secondary}`,
+                pathMeta,
+                account.lastFetchedAt ? `Fetched ${relativeTime(account.lastFetchedAt)}` : null,
+                account.updatedAt ? `Updated ${relativeTime(account.updatedAt)}` : null,
+            ].filter(Boolean).join(' • ');
+            const empty = account.cooldownUntil
+                ? `<div class="empty-window">Cooldown-only state. Resets in <span data-countdown="${escapeHtml(account.cooldownUntil)}"></span>.</div>`
+                : '<div class="empty-window">Empty state. No live, cached, or stale usage window values were returned.</div>';
+            return `
+                <article class="account-card">
+                    <div class="account-head">
+                        <div>
+                            <p class="eyebrow">accountKey</p>
+                            <div class="account-title">
+                                <span class="account-key">${escapeHtml(account.accountKey)}</span>
+                                <span class="muted">${escapeHtml(secondary)}</span>
+                            </div>
+                            <p class="account-meta">${escapeHtml(meta)}</p>
+                        </div>
+                        <div class="badge-row">
+                            <span class="badge ${sourceBadge(account.source)}">${escapeHtml(sourceLabel(account.source))}</span>
+                            ${account.stale ? '<span class="badge badge-stale">Stale</span>' : ''}
+                            ${!windows.length && account.cooldownUntil ? '<span class="badge badge-cooldown">Cooldown only</span>' : ''}
+                        </div>
+                    </div>
+                    <div class="window-list">${windows.join('') || empty}</div>
+                </article>`;
+        }
+
+        function renderErrors(errors) {
+            const body = document.getElementById('errors-body');
+            if (!errors.length) {
+                errorsSection.classList.add('hidden');
+                body.innerHTML = '';
+                return;
+            }
+            errorsSection.classList.remove('hidden');
+            body.innerHTML = errors.map((error) => `
+                <li class="error-item">Slot ${escapeHtml(String(error.slotIndex))} • ${escapeHtml(error.message)} • fallback: ${escapeHtml(error.source)}</li>`).join('');
+        }
+
+        function renderPayload(payload, status) {
+            const groupedAccounts = groupRows(getRows(payload));
+            const errors = getErrors(payload);
+            renderSummary(groupedAccounts, errors);
+            renderErrors(errors);
+
+            if (!groupedAccounts.length) {
+                const message = payload?.error?.message || (status === 401 ? 'Authentication required for /api/codex/usage.' : 'No Codex usage data available.');
+                accountsBody.innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+            } else {
+                accountsBody.innerHTML = groupedAccounts.map(renderAccount).join('');
+            }
+
+            const staleCount = groupedAccounts.filter((account) => account.stale).length;
+            const cooldownCount = groupedAccounts.filter((account) => account.cooldownUntil && !account.fiveHour && !account.weekly).length;
+            if (status === 401) {
+                setBanner('warn', 'Authorization required', 'The page received a 401 and is waiting for a bearer token.', 'The token is stored only in sessionStorage.');
+            } else if (payload?.partial) {
+                setBanner('warn', 'Partial usage snapshot', 'Some slots failed and fallback data is being shown where possible.', syncMeta(groupedAccounts, errors));
+            } else if (!groupedAccounts.length) {
+                setBanner(status === 502 ? 'error' : 'banner', 'No usage rows available', payload?.error?.message || 'No 5h or Weekly usage windows were returned.', syncMeta(groupedAccounts, errors));
+            } else if (cooldownCount) {
+                setBanner('warn', 'Cooldown-only accounts present', `${cooldownCount} account${cooldownCount === 1 ? '' : 's'} only have cooldown metadata right now.`, syncMeta(groupedAccounts, errors));
+            } else if (staleCount) {
+                setBanner('banner', 'Stale snapshot in use', `${staleCount} account${staleCount === 1 ? '' : 's'} are showing persisted usage windows.`, syncMeta(groupedAccounts, errors));
+            } else {
+                setBanner('success', 'Live Codex usage loaded', 'The dashboard is showing current same-origin usage data.', syncMeta(groupedAccounts, errors));
+            }
+
+            updateCountdowns();
+        }
+
+        async function requestUsage(token) {
+            const headers = token ? { Authorization: `Bearer ${token}` } : {};
+            const response = await fetch(`${BASE}/api/codex/usage`, {
+                method: 'GET',
+                headers,
+                credentials: 'same-origin',
+            });
+            if (response.status === 401) return { status: 401, body: { partial: false, accounts: [], slotErrors: [] } };
+            const body = await response.json();
+            return { status: response.status, body };
+        }
+
+        async function loadUsage() {
+            refreshButton.disabled = true;
+            try {
+                const token = sessionStorage.getItem(TOKEN_KEY) || '';
+                const result = await requestUsage(token.trim());
+                if (result.status === 401) {
+                    if (token) sessionStorage.removeItem(TOKEN_KEY);
+                    setAuthState(true, 'A 401 response requires Authorization. Enter the bearer token and retry.');
+                    renderPayload(result.body, 401);
+                    return;
+                }
+                setAuthState(false, '');
+                renderPayload(result.body, result.status);
+            } catch (error) {
+                setAuthState(false, '');
+                renderPayload({ partial: false, accounts: [], slotErrors: [], error: { message: error instanceof Error ? error.message : 'Failed to load Codex usage' } }, 502);
+            } finally {
+                refreshButton.disabled = false;
+            }
+        }
+
+        authForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const token = tokenInput.value.trim();
+            if (!token) {
+                setAuthState(true, 'Enter a bearer token to retry /api/codex/usage.');
+                return;
+            }
+            refreshButton.disabled = true;
+            try {
+                const result = await requestUsage(token);
+                if (result.status === 401) {
+                    sessionStorage.removeItem(TOKEN_KEY);
+                    setAuthState(true, 'Token rejected. Enter a valid bearer token.');
+                    renderPayload(result.body, 401);
+                    return;
+                }
+                sessionStorage.setItem(TOKEN_KEY, token);
+                tokenInput.value = '';
+                setAuthState(false, '');
+                renderPayload(result.body, result.status);
+            } catch (error) {
+                setAuthState(true, error instanceof Error ? error.message : 'Failed to authenticate the token.');
+            } finally {
+                refreshButton.disabled = false;
+            }
+        });
+
+        clearTokenButton.addEventListener('click', () => {
+            sessionStorage.removeItem(TOKEN_KEY);
+            tokenInput.value = '';
+            setAuthState(true, 'Stored token cleared. The next fetch will retry without Authorization.');
+            renderPayload({ partial: false, accounts: [], slotErrors: [] }, 401);
+        });
+
+        refreshButton.addEventListener('click', loadUsage);
+        setInterval(updateCountdowns, 1000);
+        setInterval(() => {
+            if (authCard.classList.contains('hidden') || sessionStorage.getItem(TOKEN_KEY)) loadUsage();
+        }, REFRESH_MS);
+        loadUsage();
+    </script>
+</body>
+</html>

@@ -6,6 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { Hono } from 'hono';
+import { createHash } from 'node:crypto';
 import { TaskTier, ClawRouteConfig } from '../src/types.js';
 
 // Mock fetch for provider calls
@@ -57,6 +58,50 @@ function createTestConfig(): ClawRouteConfig {
             ollama: '',
         },
         alerts: {},
+    };
+}
+
+function createMockExecutionResult(actualModel: string) {
+    return {
+        response: new Response(
+            JSON.stringify({
+                id: 'mock-id',
+                object: 'chat.completion',
+                created: Date.now(),
+                model: actualModel,
+                choices: [
+                    {
+                        index: 0,
+                        message: { role: 'assistant', content: 'mocked' },
+                        finish_reason: 'stop',
+                    },
+                ],
+                usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+        ),
+        routingDecision: {
+            originalModel: actualModel,
+            routedModel: actualModel,
+            tier: TaskTier.MODERATE,
+            reason: 'mocked execution',
+            confidence: 1,
+            isDryRun: false,
+            isOverride: false,
+            isPassthrough: false,
+            estimatedSavingsUsd: 0,
+            safeToRetry: true,
+        },
+        actualModel,
+        escalated: false,
+        escalationChain: [actualModel],
+        inputTokens: 5,
+        outputTokens: 2,
+        originalCostUsd: 0,
+        actualCostUsd: 0,
+        savingsUsd: 0,
+        responseTimeMs: 1,
+        hadToolCalls: false,
     };
 }
 
@@ -241,6 +286,65 @@ describe('Integration Tests', () => {
 
             expect(res.status).toBe(200);
             expect(mockFetch).toHaveBeenCalled();
+        });
+    });
+
+    describe('Codex Session Context', () => {
+        it('threads the hashed sender session into execution before Codex selection runs', async () => {
+            vi.resetModules();
+            const executeRequestMock = vi.fn(async () => createMockExecutionResult('codex/gpt-5.4-mini'));
+            vi.doMock('../src/executor.js', () => ({
+                executeRequest: executeRequestMock,
+                executePassthrough: vi.fn(async () => new Response('passthrough', { status: 200 })),
+            }));
+
+            const { createApp } = await import('../src/server.js');
+            const localApp = createApp(createTestConfig());
+            const senderId = '123456789';
+            const expectedSessionId = createHash('sha256').update(senderId).digest('hex').slice(0, 8);
+
+            const response = await localApp.request('/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: 'codex/gpt-5.4-mini',
+                    messages: [
+                        { role: 'system', content: `{"sender_id":"${senderId}"}` },
+                        { role: 'user', content: 'continue the same session' },
+                    ],
+                }),
+            });
+
+            const executionContext = executeRequestMock.mock.calls[0]?.[5] as { sessionId?: string | null } | undefined;
+
+            expect(response.status).toBe(200);
+            expect(executionContext).toMatchObject({ sessionId: expectedSessionId });
+        });
+
+        it('passes a null session context into execution when sender_id is absent', async () => {
+            vi.resetModules();
+            const executeRequestMock = vi.fn(async () => createMockExecutionResult('codex/gpt-5.4-mini'));
+            vi.doMock('../src/executor.js', () => ({
+                executeRequest: executeRequestMock,
+                executePassthrough: vi.fn(async () => new Response('passthrough', { status: 200 })),
+            }));
+
+            const { createApp } = await import('../src/server.js');
+            const localApp = createApp(createTestConfig());
+
+            const response = await localApp.request('/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: 'codex/gpt-5.4-mini',
+                    messages: [{ role: 'user', content: 'first turn without sender metadata' }],
+                }),
+            });
+
+            const executionContext = executeRequestMock.mock.calls[0]?.[5] as { sessionId?: string | null } | undefined;
+
+            expect(response.status).toBe(200);
+            expect(executionContext).toMatchObject({ sessionId: null });
         });
     });
 
